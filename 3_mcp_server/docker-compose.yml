@@ -1,0 +1,37 @@
+# =============================================================================
+# docker-compose.yml
+# Runs the cis-mcp-server HTTP service container
+#
+# Run:
+#   docker compose up -d
+#
+# Server listens on http://localhost:8765/mcp
+# =============================================================================
+
+services:
+
+  # =========================================================================
+  # CIS Benchmark MCP Server
+  # This container provides HTTP-based MCP tools endpoints
+  # =========================================================================
+  cis-mcp-server:
+    image: cis-mcp-server:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.mcp
+    container_name: cis-mcp-server
+    restart: unless-stopped
+    network_mode: "host"
+    #ports:
+    #  - "8765:8765"   # Expose to host for debugging and local integrations
+    environment:
+      ES_HOST:        "${ES_HOST:-https://127.0.0.1:9200}"
+      ES_USER:        "${ES_USER:-elastic}"
+      ES_PASSWORD:    "${ES_PASSWORD:-changeme}"
+      ES_FINGERPRINT: "${ES_FINGERPRINT:-}"
+      ES_INDEX:       "${ES_INDEX:-cis_benchmark}"
+      MCP_HOST:       "0.0.0.0"
+      MCP_PORT:       "8765"
+    volumes:
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro

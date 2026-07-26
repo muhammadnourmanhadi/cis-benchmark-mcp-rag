@@ -1,0 +1,31 @@
+# =============================================================================
+# Dockerfile for CIS Benchmark MCP Server
+# Build: docker build -f Dockerfile.mcp -t cis-mcp-server .
+# Run  : docker run -p 8765:8765 --env-file .env cis-mcp-server
+# =============================================================================
+
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Install system deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements first for build layering caching
+COPY requirements_mcp.txt .
+RUN pip install --no-cache-dir -r requirements_mcp.txt
+
+# Pre-download embedding model into the image layers
+# (prevents container from downloading it again on container bootup)
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')"
+
+# Copy source code
+COPY cis_mcp_server_http.py .
+
+# Port MCP server
+EXPOSE 8765
+
+# Entrypoint
+CMD ["python", "cis_mcp_server_http.py"]
