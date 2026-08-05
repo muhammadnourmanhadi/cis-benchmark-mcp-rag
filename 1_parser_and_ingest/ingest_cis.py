@@ -534,7 +534,7 @@ def main():
     print("=" * 60)
     print("  CIS Benchmark - State Machine PDF Parser")
     print("  Mode: Document-per-Rule (1 rule = 1 JSON document)")
-    print("  Output: {}".format(OUTPUT_JSON))
+    print("  Output: {}".format(OUTPUT_NDJSON))
     print("  Started: {}".format(start_time.strftime("%Y-%m-%d %H:%M:%S")))
     print("=" * 60)
 
