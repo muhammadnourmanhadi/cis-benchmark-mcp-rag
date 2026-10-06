@@ -39,6 +39,7 @@ import sys
 import json
 import socket
 import hashlib
+import subprocess
 import argparse
 from urllib.parse import urlparse
 from pathlib import Path
@@ -73,37 +74,60 @@ def load_env_file(path):
 class FingerprintMismatch(Exception):
     """ES_FINGERPRINT matches none of the certificates the cluster sends."""
 
-    def __init__(self, presented):
+    def __init__(self, presented, chain_read=True):
         super().__init__("Fingerprints did not match")
         self.presented = presented
+        self.chain_read = chain_read
+
+
+def _chain_via_openssl_cli(hostname, port):
+    """
+    Read the certificates the server sends with the openssl CLI. Used on
+    Python < 3.10, whose ssl module cannot return the peer's chain.
+    """
+    try:
+        out = subprocess.run(
+            ["openssl", "s_client", "-connect", "{}:{}".format(hostname, port),
+             "-servername", hostname, "-showcerts"],
+            input=b"", capture_output=True, timeout=15,
+        ).stdout.decode("ascii", "replace")
+    except (OSError, subprocess.SubprocessError):
+        return []
+    pems = re.findall(r"-----BEGIN CERTIFICATE-----.+?-----END CERTIFICATE-----", out, re.S)
+    return [ssl.PEM_cert_to_DER_cert(pem) for pem in pems]
 
 
 def presented_chain(host):
     """
-    Return the DER certificates the server actually sends (leaf first),
-    read without verification. This does not depend on the private
-    "verified chain" APIs elastic_transport uses, whose result differs
-    between Python/OpenSSL versions (e.g. python:3.12 in the MCP container
-    vs a newer Python on the host).
+    Return (certificates the server actually sends as DER, leaf first;
+    whether the full chain could be read). Read without verification, so it
+    does not depend on the private "verified chain" APIs elastic_transport
+    uses, whose result differs between Python/OpenSSL versions (and which do
+    not exist at all before Python 3.10).
     """
     url = urlparse(host)
+    port = url.port or 9200
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
-    with socket.create_connection((url.hostname, url.port or 9200), timeout=15) as raw:
+    chain = []
+    with socket.create_connection((url.hostname, port), timeout=15) as raw:
         with ctx.wrap_socket(raw, server_hostname=url.hostname) as tls:
             leaf = tls.getpeercert(True)
             try:
                 if hasattr(tls, "get_unverified_chain"):            # Python 3.13+
                     chain = [bytes(c) for c in tls.get_unverified_chain()]
-                else:                                               # Python 3.10-3.12
+                elif hasattr(tls._sslobj, "get_unverified_chain"):  # Python 3.10-3.12
                     chain = [c.public_bytes(ssl._ssl.ENCODING_DER)
                              for c in tls._sslobj.get_unverified_chain()]
             except Exception:
                 chain = []
+    if not chain:                                                   # Python < 3.10
+        chain = _chain_via_openssl_cli(url.hostname, port)
+    chain_read = bool(chain)
     if not chain or chain[0] != leaf:
         chain.insert(0, leaf)
-    return chain
+    return chain, chain_read
 
 
 def fingerprint_tls(host, fingerprint):
@@ -113,7 +137,7 @@ def fingerprint_tls(host, fingerprint):
       - matches a CA in the chain       -> verify the chain against that CA
     """
     wanted = fingerprint.replace(":", "").strip().lower()
-    chain = presented_chain(host)
+    chain, chain_read = presented_chain(host)
     prints = [hashlib.sha256(der).hexdigest() for der in chain]
     if wanted == prints[0]:
         return {"ssl_assert_fingerprint": wanted}, "server certificate fingerprint (ES_FINGERPRINT)"
@@ -127,7 +151,7 @@ def fingerprint_tls(host, fingerprint):
         # Elasticsearch CAs fail (e.g. missing key usage extension).
         ctx.verify_flags &= ~getattr(ssl, "VERIFY_X509_STRICT", 0)
         return {"ssl_context": ctx}, "CA fingerprint (ES_FINGERPRINT), CA taken from the TLS chain"
-    raise FingerprintMismatch(prints)
+    raise FingerprintMismatch(prints, chain_read)
 
 
 def get_es():
@@ -254,7 +278,12 @@ def main():
             print("ERROR: ES_FINGERPRINT does not match any certificate the cluster sends.")
             print("  ES_FINGERPRINT       : {}".format(os.getenv("ES_FINGERPRINT")))
             print("  Cluster presents     : {}".format(", ".join(presented) or "?"))
-            if len(presented) == 1:
+            if len(presented) == 1 and not getattr(e, "chain_read", True):
+                print("  Python {} cannot read the certificate chain (needs 3.10+) and the".format(
+                    sys.version.split()[0]))
+                print("  openssl CLI was not available, so only the server certificate was")
+                print("  compared. Use Python 3.10+ for this venv, or one of:")
+            elif len(presented) == 1:
                 print("  The cluster sends only its own certificate, not the CA chain, so a CA")
                 print("  fingerprint can never match. Use one of:")
                 print("    1. Verify against the CA file (recommended, survives cert renewal):")
