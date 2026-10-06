@@ -197,6 +197,8 @@ pip install "elasticsearch>=8.0.0,<10.0.0"
 ES_HOST=https://127.0.0.1:9200 ES_USER=elastic ES_PASSWORD=... ES_FINGERPRINT=... \
   python 1_parser_and_ingest/verify_es_coverage.py
 ```
+Settings that are not exported in the shell are read from `3_mcp_server/.env`, so the MCP server's configuration works as is (use `--env-file` for another file). For a self-signed cluster set `ES_FINGERPRINT` to the HTTP CA fingerprint (`openssl x509 -fingerprint -sha256 -noout -in /etc/elasticsearch/certs/http_ca.crt`) or `ES_CA_CERT` to the CA file.
+
 It lists rules in `output.ndjson` that are missing from the index and stale documents in the index that are not in `output.ndjson`.
 
 ### Step 6: Configure and Deploy the MCP Server

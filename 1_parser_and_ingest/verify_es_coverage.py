@@ -20,6 +20,9 @@ Configuration (environment variables, same as the MCP server):
     ES_CA_CERT      path to the ES CA certificate (alternative to fingerprint)
     ES_INDEX        default cis_benchmark
 
+Values not exported in the shell are read from 3_mcp_server/.env (or --env-file),
+so the same settings as the MCP server work without re-typing them.
+
 Dependencies:
     pip install "elasticsearch>=8.0.0,<10.0.0"
 
@@ -36,6 +39,29 @@ from pathlib import Path
 from collections import OrderedDict
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_ENV_FILE = SCRIPT_DIR.parent / "3_mcp_server" / ".env"
+
+
+def load_env_file(path):
+    """
+    Load KEY=VALUE pairs from an .env file (the MCP server's by default).
+    Variables already set in the environment win over the file.
+    """
+    if not path or not Path(path).is_file():
+        return False
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            if key.startswith("export "):
+                key = key[len("export "):].strip()
+            value = value.strip().strip('"').strip("'")
+            if key and value and key not in os.environ:
+                os.environ[key] = value
+    return True
 
 
 def get_es():
@@ -45,13 +71,21 @@ def get_es():
         print("ERROR: elasticsearch is not installed. Run: pip install \"elasticsearch>=8.0.0,<10.0.0\"")
         sys.exit(1)
 
-    kwargs = {"hosts": [os.getenv("ES_HOST", "https://127.0.0.1:9200")], "request_timeout": 60}
+    host = os.getenv("ES_HOST", "https://127.0.0.1:9200")
+    kwargs = {"hosts": [host], "request_timeout": 60}
     if os.getenv("ES_FINGERPRINT"):
         kwargs["ssl_assert_fingerprint"] = os.getenv("ES_FINGERPRINT")
+        tls = "certificate fingerprint (ES_FINGERPRINT)"
     elif os.getenv("ES_CA_CERT"):
         kwargs["ca_certs"] = os.getenv("ES_CA_CERT")
+        tls = "CA certificate {} (ES_CA_CERT)".format(os.getenv("ES_CA_CERT"))
+    else:
+        tls = "system CA store (set ES_FINGERPRINT or ES_CA_CERT for a self-signed cluster)"
     if os.getenv("ES_USER") and os.getenv("ES_PASSWORD"):
         kwargs["basic_auth"] = (os.getenv("ES_USER"), os.getenv("ES_PASSWORD"))
+    print("  Elasticsearch : {}".format(host))
+    if host.startswith("https"):
+        print("  TLS verify    : {}".format(tls))
     return Elasticsearch(**kwargs)
 
 
@@ -119,8 +153,15 @@ def main():
     parser = argparse.ArgumentParser(description="Verify CIS rules in Elasticsearch")
     parser.add_argument("--ndjson", type=Path, default=SCRIPT_DIR / "output.ndjson")
     parser.add_argument("--coverage-report", type=Path, default=SCRIPT_DIR / "coverage_report.json")
-    parser.add_argument("--index", default=os.getenv("ES_INDEX", "cis_benchmark"))
+    parser.add_argument("--env-file", type=Path, default=DEFAULT_ENV_FILE,
+                        help="Read ES_* settings from this file when they are not exported "
+                             "(default: %(default)s)")
+    parser.add_argument("--index", default=None)
     args = parser.parse_args()
+
+    if load_env_file(args.env_file):
+        print("  Env file      : {}".format(args.env_file))
+    args.index = args.index or os.getenv("ES_INDEX", "cis_benchmark")
 
     if not args.ndjson.is_file():
         print("ERROR: {} not found — run ingest_cis.py first.".format(args.ndjson))
@@ -135,7 +176,18 @@ def main():
     by_source = load_ndjson(args.ndjson)
     total_gaps = 0
 
-    if not es.indices.exists(index=args.index):
+    try:
+        index_exists = es.indices.exists(index=args.index)
+    except Exception as e:
+        if "CERTIFICATE_VERIFY_FAILED" in str(e):
+            print("ERROR: TLS certificate verification failed — the cluster uses a self-signed CA.")
+            print("  Set ES_FINGERPRINT (HTTP CA SHA-256 fingerprint) or ES_CA_CERT, either")
+            print("  exported in this shell (export ES_FINGERPRINT=...) or in {}.".format(args.env_file))
+            print("  Get the fingerprint with:")
+            print("    openssl x509 -fingerprint -sha256 -noout -in /etc/elasticsearch/certs/http_ca.crt")
+            return 1
+        raise
+    if not index_exists:
         print("ERROR: index '{}' does not exist — register the template and run Logstash.".format(
             args.index))
         return 1
