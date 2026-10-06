@@ -30,6 +30,9 @@ Dependencies:
 Usage:
     python 1_parser_and_ingest/verify_es_coverage.py
     python 1_parser_and_ingest/verify_es_coverage.py --ndjson path/to/output.ndjson
+    python 1_parser_and_ingest/verify_es_coverage.py \
+        --ndjson 1_parser_and_ingest/output.windows_server_2025.ndjson \
+        --coverage-report 1_parser_and_ingest/coverage_report.windows_server_2025.json
 """
 
 import os
@@ -271,6 +274,7 @@ def main():
 
     by_source = load_ndjson(args.ndjson)
     total_gaps = 0
+    total_stale = 0
 
     try:
         es = get_es()
@@ -333,6 +337,7 @@ def main():
         missing = [docs[d] for d in docs if d not in found]
         stale = sorted(ids_for_source(es, args.index, source) - set(docs))
         total_gaps += len(missing)
+        total_stale += len(stale)
 
         print("\n  [{}]".format(source))
         if source in coverage:
@@ -340,7 +345,7 @@ def main():
             print("    Official recommendations (PDF) : {:>5,d}".format(c["expected"]))
             print("    Without body in parser         : {:>5,d} {}".format(
                 len(c["missing"]), c["missing"][:10] if c["missing"] else ""))
-        print("    Rules in output.ndjson         : {:>5,d}".format(len(docs)))
+        print("    Rules in NDJSON                : {:>5,d}".format(len(docs)))
         print("    Rules found in index           : {:>5,d}".format(len(found)))
         print("    MISSING in index               : {:>5,d} {}".format(
             len(missing), missing[:20] if missing else ""))
@@ -352,23 +357,29 @@ def main():
             print("    Docs without passage vectors   : {:>5,d}".format(no_passages))
 
     # Sources in the index that this NDJSON does not cover at all
-    for source, count in sorted(sources_in_index(es, args.index).items()):
-        if source not in by_source:
-            print("\n  [{}] {:,d} docs in index, source not in {} — stale or from "
-                  "another run.".format(source, count, args.ndjson.name))
+    # Other benchmarks in the index that this NDJSON does not cover — normal
+    # when checking a single-benchmark file (ingest_cis.py --only ...)
+    others = {s: c for s, c in sources_in_index(es, args.index).items() if s not in by_source}
+    if others:
+        print("\n  Other sources in the index (not in {}, not checked):".format(args.ndjson.name))
+        for source, count in sorted(others.items()):
+            print("    {:<22s} {:>5,d} docs".format(source, count))
 
     print("\n" + "=" * 60)
     if total_gaps:
         print("  RESULT: {} rule(s) missing from the index. Check the Logstash log".format(total_gaps))
         print("  (mapping errors) and re-run the pipeline.")
     else:
-        print("  RESULT: every rule in output.ndjson is in the index.")
+        print("  RESULT: every rule in {} is in the index.".format(args.ndjson.name))
     if not nested or total_no_passages:
         print("  PASSAGES: {} — full-text vector search is incomplete. Re-run ingest_cis.py".format(
             "index has no nested mapping" if not nested
             else "{} doc(s) without passage vectors".format(total_no_passages)))
         print("  (without --no-embed) and reindex from index_template.json.")
-    print("  Stale docs: delete the index, re-register the template, re-run Logstash.")
+    if total_stale:
+        print("  STALE: {} doc(s) of the checked sources are not in {}. To remove them,".format(
+            total_stale, args.ndjson.name))
+        print("  delete the index, re-register the template and re-ingest the FULL output.ndjson.")
     print("=" * 60)
     return 1 if total_gaps or not nested or total_no_passages else 0
 

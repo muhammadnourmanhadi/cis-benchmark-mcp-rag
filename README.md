@@ -156,15 +156,18 @@ python 1_parser_and_ingest/ingest_cis.py --only windows_server_2025
 #    1_parser_and_ingest/output.windows_server_2025.ndjson
 #    1_parser_and_ingest/coverage_report.windows_server_2025.json
 ```
-To index it, copy that file to the Logstash input path (Step 5) **without deleting the index**. Logstash only adds or updates documents, so rules from the other benchmarks stay in `cis_benchmark`:
+To index it, **append** it to the Logstash input file (Step 5). Do not delete the index. Logstash picks up the new lines, and documents with the same `rule_id-source` are simply updated, so the other benchmarks stay in `cis_benchmark`:
 ```bash
-sudo cp 1_parser_and_ingest/output.windows_server_2025.ndjson /etc/logstash/conf.d/output.ndjson
-sudo systemctl restart logstash
+sudo sh -c 'cat 1_parser_and_ingest/output.windows_server_2025.ndjson >> /etc/logstash/conf.d/output.ndjson'
 python 1_parser_and_ingest/verify_es_coverage.py \
     --ndjson 1_parser_and_ingest/output.windows_server_2025.ndjson \
     --coverage-report 1_parser_and_ingest/coverage_report.windows_server_2025.json
 ```
-`verify_es_coverage.py` then reports the other benchmarks in the index as sources not covered by that NDJSON. That is expected and does not fail the run. Search it from the MCP server with `os_filter="windows_server_2025"`.
+
+> [!WARNING]
+> Do **not** copy a single-benchmark file *over* `/etc/logstash/conf.d/output.ndjson`. Logstash re-reads that file on every restart, so after the next index re-creation only that benchmark would be indexed. For a clean rebuild, run `ingest_cis.py` without `--only`: its `output.ndjson` contains every benchmark, Windows Server 2025 included.
+
+`verify_es_coverage.py` lists the other benchmarks in the index under "Other sources in the index (not checked)". That is expected for a single-benchmark file and does not fail the run. Search Windows Server 2025 from the MCP server with `os_filter="windows_server_2025"`.
 
 The pipeline runs these stages for each PDF:
 1. **PDF text extraction**: `pdfplumber` text per page, with duplicated bold glyphs removed, page footers dropped and Table of Contents pages detected.
@@ -175,7 +178,7 @@ The pipeline runs these stages for each PDF:
    - IDs that are not official recommendations and have no body are dropped.
    - Any official rule the state machine missed is rebuilt from the body pages (`metadata.parse_method = "recovered"`).
    - Content that ran into the next rule is trimmed.
-5. **Coverage report**: expected vs parsed counts, recovered, dropped and missing rules. It is printed and saved to `coverage_report.json`. **`MISSING` must be `0`.**
+5. **Coverage report**: expected vs parsed counts, recovered, dropped and missing rules. It is printed and saved to `coverage_report.json` (`coverage_report.<source>.json` for an `--only` run). **`MISSING` must be `0`.**
 6. **Post-processing**: extracts `sections.audit_text` and `sections.remediation_text`, then `metadata.profile_applicability`. It backfills `metadata.cis_level` from Profile Applicability (RHEL headers carry no level).
 7. **Passage embedding**: each rule is split into passages that fit the model's 256-token window:
    - Every passage starts with `rule_id (level) title (status)`.
@@ -244,7 +247,7 @@ For each source, the script reports:
 * the official recommendations from `coverage_report.json`
 * the rules in `output.ndjson`
 * the rules found in the index, and the ones **missing** from it
-* **stale** documents in the index that are not in `output.ndjson`
+* **stale** documents of those sources that are in the index but not in the NDJSON (other benchmarks in the index are listed separately and not checked)
 * documents **without passage vectors**
 
 It exits with code 1 in any of these cases:
