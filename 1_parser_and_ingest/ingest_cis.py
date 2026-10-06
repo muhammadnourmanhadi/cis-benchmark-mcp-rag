@@ -40,7 +40,8 @@ Output:
 
 Dependencies:
     pip install torch --index-url https://download.pytorch.org/whl/cpu   (CPU-only, smaller)
-    pip install pdfplumber pypdf sentence-transformers
+    pip install -r 1_parser_and_ingest/requirements_ingest.txt
+    (--no-embed only needs: pip install pdfplumber pypdf)
 
 Usage:
     python 1_parser_and_ingest/ingest_cis.py              # parse + embed all PDFs

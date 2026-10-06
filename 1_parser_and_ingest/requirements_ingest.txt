@@ -1,0 +1,16 @@
+# requirements untuk ingest_cis.py dan verify_es_coverage.py
+#
+# What each step needs:
+#   Parsing + chunking per rule + coverage check (--no-embed): pdfplumber, pypdf (~75 MB)
+#   Embedding (default run):  + sentence-transformers + torch
+#   verify_es_coverage.py:    + elasticsearch
+#
+# torch is NOT listed here: install the CPU-only build first. The default PyPI
+# torch wheel on Linux is the CUDA build (~555 MB) and pulls >1 GB of nvidia-*
+# packages. Skip that line only if you embed on an NVIDIA GPU.
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   pip install -r 1_parser_and_ingest/requirements_ingest.txt
+pdfplumber>=0.10
+pypdf>=4.0
+sentence-transformers>=3.0.0
+elasticsearch>=8.0.0,<10.0.0

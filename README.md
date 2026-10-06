@@ -37,7 +37,9 @@ This **Hybrid Integration** ensures that querying *"password policy"* restricted
 ```text
 ├── 1_parser_and_ingest/       # PDF Extraction & Ingestion Pipeline
 │   ├── cis_benchmarks/        # Place your downloaded official CIS PDFs here (gitignored)
-│   └── ingest_cis.py          # State-machine parser and vector embedding generator
+│   ├── ingest_cis.py          # State-machine parser and vector embedding generator
+│   ├── verify_es_coverage.py  # Checks every parsed rule reached Elasticsearch
+│   └── requirements_ingest.txt # Ingestion dependencies (install CPU torch first)
 │
 ├── 2_elasticsearch_config/    # Database Schema Mapping & Logstash Pipelines
 │   ├── index_template.json    # ES mapping template with dense_vector schema configurations
@@ -107,7 +109,10 @@ source venv/bin/activate
 # CPU-only PyTorch first (the default Linux wheel is the CUDA build, ~1.5 GB with nvidia-* packages).
 # Skip this line if you have an NVIDIA GPU and want to embed on it.
 pip install torch --index-url https://download.pytorch.org/whl/cpu
-pip install pdfplumber pypdf sentence-transformers
+pip install -r 1_parser_and_ingest/requirements_ingest.txt
+
+# Only checking parsing/coverage (--no-embed)? This is all you need (~75 MB, no torch):
+# pip install pdfplumber pypdf
 ```
 
 ### Step 2: Download CIS Benchmarks PDF
