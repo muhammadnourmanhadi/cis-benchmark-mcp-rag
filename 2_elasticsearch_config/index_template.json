@@ -8,8 +8,28 @@
           "type": "keyword"
         },
         "text_embedding": {
+          "type": "dense_vector",
           "dims": 384,
-          "type": "dense_vector"
+          "index": true,
+          "similarity": "cosine"
+        },
+        "passages": {
+          "type": "nested",
+          "properties": {
+            "chunk_id": {
+              "type": "integer"
+            },
+            "text": {
+              "type": "text",
+              "index": false
+            },
+            "vector": {
+              "type": "dense_vector",
+              "dims": 384,
+              "index": true,
+              "similarity": "cosine"
+            }
+          }
         },
         "metadata": {
           "type": "object",

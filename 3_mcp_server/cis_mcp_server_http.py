@@ -33,6 +33,8 @@ MCP_PORT       = int(os.getenv("MCP_PORT", "8765"))
 MCP_HOST       = os.getenv("MCP_HOST",    "0.0.0.0")
 
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+PASSAGE_VECTOR_FIELD = "passages.vector"   # one vector per passage (nested)
+RULE_VECTOR_FIELD    = "text_embedding"    # one vector per rule (fallback)
 # ======================================================================
 
 logging.basicConfig(
@@ -175,31 +177,49 @@ def search_cis_benchmark(
     if os_filter:
         filters.append({"term": {"metadata.source": os_filter.strip().lower()}})
 
-    # Construct the Elasticsearch search payload using the new schema
-    knn_payload = {
-        "field": "text_embedding",
-        "query_vector": query_vector,
-        "k": top_k,
-        "num_candidates": top_k * 10
-    }
-
-    if filters:
-        knn_payload["filter"] = {
-            "bool": {
-                "filter": filters
-            }
+    # Construct the Elasticsearch kNN payload. Each rule is stored as one
+    # document with one vector per passage (nested "passages.vector"), so the
+    # whole rule text is searchable — not only the first 256 tokens. ES returns
+    # each matching rule once, scored by its best passage.
+    def build_knn(field):
+        payload = {
+            "field": field,
+            "query_vector": query_vector,
+            "k": top_k,
+            "num_candidates": max(top_k * 10, 50)
         }
+        if filters:
+            payload["filter"] = {
+                "bool": {
+                    "filter": filters
+                }
+            }
+        return payload
+
+    source_fields = [
+        "rule_id", "rule_title", "metadata.profile_applicability",
+        "sections.audit_text", "sections.remediation_text", "metadata.source"
+    ]
 
     es = get_es()
+    response = None
     try:
         response = es.search(
             index=ES_INDEX,
-            knn=knn_payload,
-            source=[
-                "rule_id", "rule_title", "metadata.profile_applicability", 
-                "sections.audit_text", "sections.remediation_text", "metadata.source"
-            ]
+            knn=build_knn(PASSAGE_VECTOR_FIELD),
+            source=source_fields
         )
+    except Exception as e:
+        # ES < 8.11 (no nested kNN) or an index created before passages existed
+        log.warning(f"Passage kNN search failed, falling back to {RULE_VECTOR_FIELD}: {e}")
+
+    try:
+        if response is None or not response["hits"]["hits"]:
+            response = es.search(
+                index=ES_INDEX,
+                knn=build_knn(RULE_VECTOR_FIELD),
+                source=source_fields
+            )
     except Exception as e:
         log.error(f"Elasticsearch search failed: {e}")
         return {
