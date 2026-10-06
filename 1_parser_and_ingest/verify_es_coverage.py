@@ -17,7 +17,8 @@ Configuration (environment variables, same as the MCP server):
     ES_HOST         default https://127.0.0.1:9200
     ES_USER / ES_PASSWORD
     ES_FINGERPRINT  SHA-256 fingerprint of the ES HTTP certificate
-    ES_CA_CERT      path to the ES CA certificate (alternative to fingerprint)
+    ES_CA_CERT      path to the ES HTTP CA certificate (takes precedence over
+                    ES_FINGERPRINT; use it when the cluster does not send its CA)
     ES_INDEX        default cis_benchmark
 
 Values not exported in the shell are read from 3_mcp_server/.env (or --env-file),
@@ -32,6 +33,7 @@ Usage:
 """
 
 import os
+import re
 import sys
 import json
 import argparse
@@ -73,12 +75,14 @@ def get_es():
 
     host = os.getenv("ES_HOST", "https://127.0.0.1:9200")
     kwargs = {"hosts": [host], "request_timeout": 60}
-    if os.getenv("ES_FINGERPRINT"):
-        kwargs["ssl_assert_fingerprint"] = os.getenv("ES_FINGERPRINT")
-        tls = "certificate fingerprint (ES_FINGERPRINT)"
-    elif os.getenv("ES_CA_CERT"):
+    if os.getenv("ES_CA_CERT"):
+        # The CA file wins over a fingerprint: it does not depend on the cluster
+        # sending its CA in the TLS chain, and survives certificate renewal.
         kwargs["ca_certs"] = os.getenv("ES_CA_CERT")
         tls = "CA certificate {} (ES_CA_CERT)".format(os.getenv("ES_CA_CERT"))
+    elif os.getenv("ES_FINGERPRINT"):
+        kwargs["ssl_assert_fingerprint"] = os.getenv("ES_FINGERPRINT")
+        tls = "certificate fingerprint (ES_FINGERPRINT)"
     else:
         tls = "system CA store (set ES_FINGERPRINT or ES_CA_CERT for a self-signed cluster)"
     if os.getenv("ES_USER") and os.getenv("ES_PASSWORD"):
@@ -179,6 +183,20 @@ def main():
     try:
         index_exists = es.indices.exists(index=args.index)
     except Exception as e:
+        if "Fingerprints did not match" in str(e):
+            presented = re.findall(r'"([0-9a-fA-F:]{40,})"', str(e))[1:]
+            print("ERROR: ES_FINGERPRINT does not match any certificate the cluster sends.")
+            print("  ES_FINGERPRINT       : {}".format(os.getenv("ES_FINGERPRINT")))
+            print("  Cluster presents     : {}".format(", ".join(presented) or "?"))
+            if len(presented) == 1:
+                print("  The cluster sends only its own certificate, not the CA chain, so a CA")
+                print("  fingerprint can never match. Use one of:")
+                print("    1. Verify against the CA file (recommended, survives cert renewal):")
+                print("         ES_CA_CERT=/path/to/http_ca.crt   (copy of /etc/elasticsearch/certs/http_ca.crt)")
+                print("       and remove ES_FINGERPRINT.")
+                print("    2. Pin the certificate the cluster presents (changes when it is renewed):")
+                print("         ES_FINGERPRINT={}".format(presented[0]))
+            return 1
         if "CERTIFICATE_VERIFY_FAILED" in str(e):
             print("ERROR: TLS certificate verification failed — the cluster uses a self-signed CA.")
             print("  Set ES_FINGERPRINT (HTTP CA SHA-256 fingerprint) or ES_CA_CERT, either")
