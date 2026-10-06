@@ -1,6 +1,7 @@
 # requirements untuk cis_mcp_server_http.py
-mcp[cli]>=1.9.0
-fastmcp>=2.0.0
+# mcp 2.x renamed FastMCP to MCPServer (mcp.server.fastmcp no longer exists);
+# this server is written against the 1.x API.
+mcp[cli]>=1.9.0,<2
 sentence-transformers>=3.0.0
 elasticsearch>=8.0.0,<10.0.0
 uvicorn>=0.30.0
