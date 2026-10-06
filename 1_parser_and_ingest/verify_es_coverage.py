@@ -34,9 +34,13 @@ Usage:
 
 import os
 import re
+import ssl
 import sys
 import json
+import socket
+import hashlib
 import argparse
+from urllib.parse import urlparse
 from pathlib import Path
 from collections import OrderedDict
 
@@ -66,6 +70,66 @@ def load_env_file(path):
     return True
 
 
+class FingerprintMismatch(Exception):
+    """ES_FINGERPRINT matches none of the certificates the cluster sends."""
+
+    def __init__(self, presented):
+        super().__init__("Fingerprints did not match")
+        self.presented = presented
+
+
+def presented_chain(host):
+    """
+    Return the DER certificates the server actually sends (leaf first),
+    read without verification. This does not depend on the private
+    "verified chain" APIs elastic_transport uses, whose result differs
+    between Python/OpenSSL versions (e.g. python:3.12 in the MCP container
+    vs a newer Python on the host).
+    """
+    url = urlparse(host)
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    with socket.create_connection((url.hostname, url.port or 9200), timeout=15) as raw:
+        with ctx.wrap_socket(raw, server_hostname=url.hostname) as tls:
+            leaf = tls.getpeercert(True)
+            try:
+                if hasattr(tls, "get_unverified_chain"):            # Python 3.13+
+                    chain = [bytes(c) for c in tls.get_unverified_chain()]
+                else:                                               # Python 3.10-3.12
+                    chain = [c.public_bytes(ssl._ssl.ENCODING_DER)
+                             for c in tls._sslobj.get_unverified_chain()]
+            except Exception:
+                chain = []
+    if not chain or chain[0] != leaf:
+        chain.insert(0, leaf)
+    return chain
+
+
+def fingerprint_tls(host, fingerprint):
+    """
+    Resolve ES_FINGERPRINT against the certificates the server sends:
+      - matches the server certificate -> pin it (ssl_assert_fingerprint)
+      - matches a CA in the chain       -> verify the chain against that CA
+    """
+    wanted = fingerprint.replace(":", "").strip().lower()
+    chain = presented_chain(host)
+    prints = [hashlib.sha256(der).hexdigest() for der in chain]
+    if wanted == prints[0]:
+        return {"ssl_assert_fingerprint": wanted}, "server certificate fingerprint (ES_FINGERPRINT)"
+    if wanted in prints[1:]:
+        ca_pem = ssl.DER_cert_to_PEM_cert(chain[prints.index(wanted)])
+        ctx = ssl.create_default_context(cadata=ca_pem)
+        # Pinned private CA: same trust model as a fingerprint, so no hostname
+        # check (the ES_HOST name/IP may not be in the certificate SANs).
+        ctx.check_hostname = False
+        # Python 3.13 enables strict X.509 checks that some self-signed
+        # Elasticsearch CAs fail (e.g. missing key usage extension).
+        ctx.verify_flags &= ~getattr(ssl, "VERIFY_X509_STRICT", 0)
+        return {"ssl_context": ctx}, "CA fingerprint (ES_FINGERPRINT), CA taken from the TLS chain"
+    raise FingerprintMismatch(prints)
+
+
 def get_es():
     try:
         from elasticsearch import Elasticsearch
@@ -75,19 +139,20 @@ def get_es():
 
     host = os.getenv("ES_HOST", "https://127.0.0.1:9200")
     kwargs = {"hosts": [host], "request_timeout": 60}
+    print("  Elasticsearch : {}".format(host))
+    print("  Python/OpenSSL: {} / {}".format(sys.version.split()[0], ssl.OPENSSL_VERSION))
     if os.getenv("ES_CA_CERT"):
         # The CA file wins over a fingerprint: it does not depend on the cluster
         # sending its CA in the TLS chain, and survives certificate renewal.
         kwargs["ca_certs"] = os.getenv("ES_CA_CERT")
         tls = "CA certificate {} (ES_CA_CERT)".format(os.getenv("ES_CA_CERT"))
-    elif os.getenv("ES_FINGERPRINT"):
-        kwargs["ssl_assert_fingerprint"] = os.getenv("ES_FINGERPRINT")
-        tls = "certificate fingerprint (ES_FINGERPRINT)"
+    elif os.getenv("ES_FINGERPRINT") and host.startswith("https"):
+        extra, tls = fingerprint_tls(host, os.getenv("ES_FINGERPRINT"))
+        kwargs.update(extra)
     else:
         tls = "system CA store (set ES_FINGERPRINT or ES_CA_CERT for a self-signed cluster)"
     if os.getenv("ES_USER") and os.getenv("ES_PASSWORD"):
         kwargs["basic_auth"] = (os.getenv("ES_USER"), os.getenv("ES_PASSWORD"))
-    print("  Elasticsearch : {}".format(host))
     if host.startswith("https"):
         print("  TLS verify    : {}".format(tls))
     return Elasticsearch(**kwargs)
@@ -176,15 +241,16 @@ def main():
         with open(args.coverage_report, "r", encoding="utf-8") as f:
             coverage = {c["source"]: c for c in json.load(f)}
 
-    es = get_es()
     by_source = load_ndjson(args.ndjson)
     total_gaps = 0
 
     try:
+        es = get_es()
         index_exists = es.indices.exists(index=args.index)
     except Exception as e:
-        if "Fingerprints did not match" in str(e):
-            presented = re.findall(r'"([0-9a-fA-F:]{40,})"', str(e))[1:]
+        if isinstance(e, FingerprintMismatch) or "Fingerprints did not match" in str(e):
+            presented = getattr(e, "presented", None) or \
+                re.findall(r'"([0-9a-fA-F:]{40,})"', str(e))[1:]
             print("ERROR: ES_FINGERPRINT does not match any certificate the cluster sends.")
             print("  ES_FINGERPRINT       : {}".format(os.getenv("ES_FINGERPRINT")))
             print("  Cluster presents     : {}".format(", ".join(presented) or "?"))
