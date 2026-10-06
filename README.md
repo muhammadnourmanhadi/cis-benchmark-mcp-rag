@@ -63,7 +63,7 @@ To set up and run this project, your environment must satisfy the following:
 
 1. **Python Runtime**: Python 3.10+ (Python 3.11/3.12 recommended).
 2. **PyTorch & Transformers Setup**: System memory of at least 8GB RAM is recommended to run local embedding models (`all-MiniLM-L6-v2`).
-3. **Database**: Elasticsearch **8.11 or newer** with k-NN/vector search enabled (nested kNN over `passages.vector`). Older versions still work through the single `text_embedding` fallback vector.
+3. **Database**: Elasticsearch **8.11 or newer** with k-NN/vector search enabled. The index template maps an indexed `dense_vector` inside the nested `passages` field, which older versions reject. (The MCP server still falls back to the single `text_embedding` vector for an index created before `passages` existed.)
 4. **Logstash Ingestion Pipeline**: Logstash instance configured with [cis_benchmark.conf](2_elasticsearch_config/cis_benchmark.conf) to stream NDJSON records into Elasticsearch.
 5. **Docker**: Docker Engine & Docker Compose installed for running the MCP server container.
 

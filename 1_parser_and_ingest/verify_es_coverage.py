@@ -106,7 +106,7 @@ def presented_chain(host):
     not exist at all before Python 3.10).
     """
     url = urlparse(host)
-    port = url.port or 9200
+    port = url.port or (443 if url.scheme == "https" else 80)   # same default as the ES client
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -206,11 +206,15 @@ def ids_in_index(es, index, doc_ids):
     return found
 
 
+def has_nested_passages(es, index):
+    """True if every index behind the name maps "passages" as nested."""
+    mappings = es.indices.get_mapping(index=index).values()
+    return all(m["mappings"].get("properties", {}).get("passages", {}).get("type") == "nested"
+               for m in mappings)
+
+
 def count_without_passages(es, index, source):
     """Documents of one source that have no passage vectors (full-text search misses them)."""
-    mapping = next(iter(es.indices.get_mapping(index=index).values()))["mappings"]
-    if mapping.get("properties", {}).get("passages", {}).get("type") != "nested":
-        return None   # index predates passages — reported once in main()
     query = {"bool": {
         "filter": [{"term": {"metadata.source": source}}],
         "must_not": [{"nested": {"path": "passages", "query": {"exists": {"field": "passages.vector"}}}}],
@@ -271,7 +275,15 @@ def main():
     try:
         es = get_es()
         index_exists = es.indices.exists(index=args.index)
+    except (OSError, ConnectionError) as e:
+        print("ERROR: cannot connect to {}: {}".format(os.getenv("ES_HOST", "https://127.0.0.1:9200"), e))
+        print("  Check that Elasticsearch is running and ES_HOST (scheme, host, port) is correct.")
+        return 1
     except Exception as e:
+        if type(e).__name__ in ("ConnectionError", "ConnectionTimeout") and "TLS" not in str(e):
+            print("ERROR: cannot connect to {}: {}".format(os.getenv("ES_HOST", "https://127.0.0.1:9200"), e))
+            print("  Check that Elasticsearch is running and ES_HOST (scheme, host, port) is correct.")
+            return 1
         if isinstance(e, FingerprintMismatch) or "Fingerprints did not match" in str(e):
             presented = getattr(e, "presented", None) or \
                 re.findall(r'"([0-9a-fA-F:]{40,})"', str(e))[1:]
@@ -305,6 +317,13 @@ def main():
             args.index))
         return 1
 
+    nested = has_nested_passages(es, args.index)
+    total_no_passages = 0
+    if not nested:
+        print("\n  WARNING: index '{}' has no nested 'passages' mapping — the MCP server can".format(args.index))
+        print("  only search the single text_embedding vector. Delete the index, re-register")
+        print("  index_template.json (Elasticsearch 8.11+) and re-run Logstash.")
+
     print("=" * 60)
     print("  Elasticsearch coverage check — index: {}".format(args.index))
     print("=" * 60)
@@ -327,11 +346,9 @@ def main():
             len(missing), missing[:20] if missing else ""))
         print("    Stale docs (not in NDJSON)     : {:>5,d} {}".format(
             len(stale), stale[:20] if stale else ""))
-        no_passages = count_without_passages(es, args.index, source)
-        if no_passages is None:
-            print("    Passage vectors                : index has no nested 'passages' mapping —")
-            print("                                     delete it and recreate from index_template.json")
-        else:
+        if nested:
+            no_passages = count_without_passages(es, args.index, source)
+            total_no_passages += no_passages
             print("    Docs without passage vectors   : {:>5,d}".format(no_passages))
 
     # Sources in the index that this NDJSON does not cover at all
@@ -346,9 +363,14 @@ def main():
         print("  (mapping errors) and re-run the pipeline.")
     else:
         print("  RESULT: every rule in output.ndjson is in the index.")
+    if not nested or total_no_passages:
+        print("  PASSAGES: {} — full-text vector search is incomplete. Re-run ingest_cis.py".format(
+            "index has no nested mapping" if not nested
+            else "{} doc(s) without passage vectors".format(total_no_passages)))
+        print("  (without --no-embed) and reindex from index_template.json.")
     print("  Stale docs: delete the index, re-register the template, re-run Logstash.")
     print("=" * 60)
-    return 1 if total_gaps else 0
+    return 1 if total_gaps or not nested or total_no_passages else 0
 
 
 if __name__ == "__main__":

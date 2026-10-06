@@ -962,9 +962,19 @@ def _split_long_line(line, tokenizer, budget):
                 pieces.append((" ".join(words), words_len))
                 words, words_len = [], 0
             ids = tokenizer.encode(word, add_special_tokens=False)
-            for i in range(0, len(ids), budget):
-                piece = tokenizer.decode(ids[i:i + budget])
-                pieces.append((piece, _token_count(tokenizer, piece)))
+            i = 0
+            while i < len(ids):
+                # A decoded wordpiece slice ("##abc") can re-tokenize to more
+                # tokens than the slice, so shrink it until it fits the budget.
+                step = budget
+                while True:
+                    piece = tokenizer.decode(ids[i:i + step])
+                    n_piece = _token_count(tokenizer, piece)
+                    if n_piece <= budget or step == 1:
+                        break
+                    step = max(1, step - (n_piece - budget))
+                pieces.append((piece, n_piece))
+                i += step
             continue
         if words and words_len + n > budget:
             pieces.append((" ".join(words), words_len))

@@ -97,15 +97,19 @@ _vector_field = None
 
 def get_vector_field() -> str:
     """
-    Pick the kNN field once from the index mapping: nested passage vectors
+    Pick the kNN field from the index mapping (cached until a search fails,
+    so a recreated index is picked up): nested passage vectors
     when the index has them (template with "passages" + ES 8.11+), otherwise
     the single whole-rule vector of an index created before passages existed.
     """
     global _vector_field
     if _vector_field is None:
-        mapping = get_es().indices.get_mapping(index=ES_INDEX)
-        props = next(iter(mapping.values()))["mappings"].get("properties", {})
-        if props.get("passages", {}).get("type") == "nested":
+        # ES_INDEX may be an alias: use passages only if every index has them
+        mappings = get_es().indices.get_mapping(index=ES_INDEX).values()
+        if mappings and all(
+            m["mappings"].get("properties", {}).get("passages", {}).get("type") == "nested"
+            for m in mappings
+        ):
             _vector_field = PASSAGE_VECTOR_FIELD
         else:
             _vector_field = RULE_VECTOR_FIELD
@@ -233,6 +237,8 @@ def search_cis_benchmark(
             source=source_fields
         )
     except Exception as e:
+        global _vector_field
+        _vector_field = None   # re-read the mapping next time (e.g. index recreated)
         log.error(f"Elasticsearch search failed: {e}")
         return {
             "error": str(e),
