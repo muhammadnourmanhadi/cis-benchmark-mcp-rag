@@ -19,10 +19,6 @@
             "chunk_id": {
               "type": "integer"
             },
-            "text": {
-              "type": "text",
-              "index": false
-            },
             "vector": {
               "type": "dense_vector",
               "dims": 384,

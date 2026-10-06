@@ -935,41 +935,86 @@ def _token_count(tokenizer, text):
     return len(tokenizer.encode(text, add_special_tokens=False))
 
 
+def _passage_header(rule):
+    """'<rule_id> (<level>) <title> (<status>)' — same wording as the rule header."""
+    meta = rule["metadata"]
+    return " ".join(part for part in (
+        rule["rule_id"],
+        "({})".format(meta["cis_level"]) if meta.get("cis_level") else "",
+        rule["rule_title"],
+        "({})".format(meta["automation_status"]) if meta.get("automation_status") else "",
+    ) if part)
+
+
+def _split_long_line(line, tokenizer, budget):
+    """
+    Cut a line longer than the budget at word boundaries, keeping the
+    original text. A single word longer than the budget is cut by tokens.
+    """
+    pieces = []
+    words, words_len = [], 0
+    for word in line.split(" "):
+        n = _token_count(tokenizer, word)
+        if n > budget:
+            if words:
+                pieces.append((" ".join(words), words_len))
+                words, words_len = [], 0
+            ids = tokenizer.encode(word, add_special_tokens=False)
+            for i in range(0, len(ids), budget):
+                piece = tokenizer.decode(ids[i:i + budget])
+                pieces.append((piece, _token_count(tokenizer, piece)))
+            continue
+        if words and words_len + n > budget:
+            pieces.append((" ".join(words), words_len))
+            words, words_len = [], 0
+        words.append(word)
+        words_len += n
+    if words:
+        pieces.append((" ".join(words), words_len))
+    return pieces
+
+
 def split_passages(rule, tokenizer, max_tokens):
     """
     Split a rule's full text into passages that fit the embedding model's
     token window, so no part of the rule is truncated away.
 
-    Every passage starts with "<rule_id> <rule_title>" so it keeps its context,
-    is packed line by line (lines longer than the window are cut by tokens),
-    and repeats the last ~PASSAGE_OVERLAP_TOKENS of the previous passage.
+    Every passage starts with the rule header (ID, level, title, status) so it
+    keeps its context, is packed line by line (lines longer than the budget are
+    cut at word boundaries), and repeats up to PASSAGE_OVERLAP_TOKENS from the
+    end of the previous passage when that still fits the budget.
     """
-    header = "{} {}".format(rule["rule_id"], rule["rule_title"])
-    # [CLS] + [SEP] + newline + a small safety margin
-    budget = max(32, max_tokens - _token_count(tokenizer, header) - 8)
+    # [CLS] + [SEP] + newline + safety margin for re-tokenization of joined lines
+    reserved = 8
+    header = _passage_header(rule)
+    header_ids = tokenizer.encode(header, add_special_tokens=False)
+    if len(header_ids) > max_tokens // 2:
+        # Extremely long title: shorten the header, never the content
+        header = tokenizer.decode(header_ids[:max_tokens // 2])
+        header_ids = tokenizer.encode(header, add_special_tokens=False)
+    budget = max_tokens - len(header_ids) - reserved
 
     lines = []
     for line in rule["content_for_vector"].split("\n")[1:]:   # line 0 = header
         line = line.strip()
         if not line:
             continue
-        ids = tokenizer.encode(line, add_special_tokens=False)
-        if len(ids) <= budget:
-            lines.append((line, len(ids)))
-            continue
-        for i in range(0, len(ids), budget):
-            piece = ids[i:i + budget]
-            lines.append((tokenizer.decode(piece), len(piece)))
+        n = _token_count(tokenizer, line)
+        if n <= budget:
+            lines.append((line, n))
+        else:
+            lines.extend(_split_long_line(line, tokenizer, budget))
 
     passages = []
     current, current_len = [], 0
     for line, n in lines:
         if current and current_len + n > budget:
             passages.append(current)
-            # Overlap: carry the tail of the previous passage forward
+            # Overlap: carry the tail of the previous passage forward, but never
+            # the whole passage and never more than the next line leaves room for
             carry, carry_len = [], 0
-            for prev_line, prev_n in reversed(current):
-                if carry_len + prev_n > PASSAGE_OVERLAP_TOKENS:
+            for prev_line, prev_n in reversed(current[1:]):
+                if carry_len + prev_n > min(PASSAGE_OVERLAP_TOKENS, budget - n):
                     break
                 carry.insert(0, (prev_line, prev_n))
                 carry_len += prev_n
@@ -989,7 +1034,7 @@ def embed_rules(all_rules):
     all-MiniLM-L6-v2 only reads its first 256 tokens, while a CIS rule is
     often 1,000-3,000 tokens. Each rule is therefore split into passages
     that fit the window and every passage is embedded:
-      - rule["passages"]       — [{chunk_id, text, vector}] for nested kNN search
+      - rule["passages"]       — [{chunk_id, vector}] for nested kNN search
       - rule["text_embedding"] — normalized mean of the passage vectors
                                  (single-vector fallback covering the whole rule)
     """
@@ -1044,8 +1089,7 @@ def embed_rules(all_rules):
         vectors = all_embeddings[pos:pos + len(passages)]
         pos += len(passages)
         rule["passages"] = [
-            {"chunk_id": i, "text": text, "vector": vector}
-            for i, (text, vector) in enumerate(zip(passages, vectors))
+            {"chunk_id": i, "vector": vector} for i, vector in enumerate(vectors)
         ]
         mean = np.mean(np.array(vectors), axis=0)
         rule["text_embedding"] = (mean / (np.linalg.norm(mean) or 1.0)).tolist()

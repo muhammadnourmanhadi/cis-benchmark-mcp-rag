@@ -92,6 +92,30 @@ def get_es():
     return _es
 
 
+_vector_field = None
+
+
+def get_vector_field() -> str:
+    """
+    Pick the kNN field once from the index mapping: nested passage vectors
+    when the index has them (template with "passages" + ES 8.11+), otherwise
+    the single whole-rule vector of an index created before passages existed.
+    """
+    global _vector_field
+    if _vector_field is None:
+        mapping = get_es().indices.get_mapping(index=ES_INDEX)
+        props = next(iter(mapping.values()))["mappings"].get("properties", {})
+        if props.get("passages", {}).get("type") == "nested":
+            _vector_field = PASSAGE_VECTOR_FIELD
+        else:
+            _vector_field = RULE_VECTOR_FIELD
+            log.warning(f"Index '{ES_INDEX}' has no nested 'passages' mapping — "
+                        f"searching '{RULE_VECTOR_FIELD}' only. Recreate the index "
+                        f"from index_template.json to search full rule text.")
+        log.info(f"kNN search field: {_vector_field}")
+    return _vector_field
+
+
 # ======================================================================
 # Initialize FastMCP server
 # ======================================================================
@@ -202,24 +226,12 @@ def search_cis_benchmark(
     ]
 
     es = get_es()
-    response = None
     try:
         response = es.search(
             index=ES_INDEX,
-            knn=build_knn(PASSAGE_VECTOR_FIELD),
+            knn=build_knn(get_vector_field()),
             source=source_fields
         )
-    except Exception as e:
-        # ES < 8.11 (no nested kNN) or an index created before passages existed
-        log.warning(f"Passage kNN search failed, falling back to {RULE_VECTOR_FIELD}: {e}")
-
-    try:
-        if response is None or not response["hits"]["hits"]:
-            response = es.search(
-                index=ES_INDEX,
-                knn=build_knn(RULE_VECTOR_FIELD),
-                source=source_fields
-            )
     except Exception as e:
         log.error(f"Elasticsearch search failed: {e}")
         return {

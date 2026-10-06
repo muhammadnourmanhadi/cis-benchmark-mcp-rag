@@ -132,7 +132,7 @@ The script performs the following pipeline in sequence:
 5. **Coverage Report**: Prints expected vs parsed counts per PDF and lists recovered, dropped and missing rules. Saved to `1_parser_and_ingest/coverage_report.json`.
 6. **Post-Processing**: Extracts structured fields from raw content using regex: `sections.audit_text`, `sections.remediation_text`, `metadata.profile_applicability`, and backfills `metadata.cis_level` for RHEL rules from Profile Applicability text.
 7. **Passage Embedding**: `all-MiniLM-L6-v2` only reads 256 tokens, while a CIS rule averages ~3,600 characters. Each rule is split into passages that fit the window (each starts with `rule_id + title`, with ~32 tokens of overlap), and every passage is embedded in batches (default: 64). Each document gets:
-   * `passages[]` — `{chunk_id, text, vector}` per passage, searched with nested kNN by the MCP server (each rule is returned once, scored by its best passage).
+   * `passages[]` — `{chunk_id, vector}` per passage, searched with nested kNN by the MCP server (each rule is returned once, scored by its best passage).
    * `text_embedding` — normalized mean of the passage vectors, a single-vector fallback that covers the whole rule.
 8. **Quality Report**: Prints per-OS rule counts, CIS Level distribution, automation status breakdown, section extraction coverage percentages, and content length statistics.
 
@@ -144,6 +144,12 @@ This generates:
 
 > [!IMPORTANT]
 > **Register the index template BEFORE streaming data via Logstash.** This ensures Elasticsearch maps `text_embedding` and the nested `passages.vector` fields as `dense_vector` types rather than dynamically indexing them as auto-detected float lists.
+
+> [!WARNING]
+> An index template only applies to **newly created** indices. If `cis_benchmark` already exists (for example from a run before the nested `passages` field was added), delete it first — otherwise `passages` is mapped as a plain object and the MCP server can only search the single `text_embedding` vector.
+> ```bash
+> curl -X DELETE "https://YOUR_ES_HOST:9200/cis_benchmark"
+> ```
 
 Apply the custom index template to your Elasticsearch instance:
 ```bash

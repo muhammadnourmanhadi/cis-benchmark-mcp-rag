@@ -79,6 +79,18 @@ def ids_in_index(es, index, doc_ids):
     return found
 
 
+def count_without_passages(es, index, source):
+    """Documents of one source that have no passage vectors (full-text search misses them)."""
+    mapping = next(iter(es.indices.get_mapping(index=index).values()))["mappings"]
+    if mapping.get("properties", {}).get("passages", {}).get("type") != "nested":
+        return None   # index predates passages — reported once in main()
+    query = {"bool": {
+        "filter": [{"term": {"metadata.source": source}}],
+        "must_not": [{"nested": {"path": "passages", "query": {"exists": {"field": "passages.vector"}}}}],
+    }}
+    return es.count(index=index, query=query)["count"]
+
+
 def ids_for_source(es, index, source):
     """Return every document ID stored for one source."""
     ids = set()
@@ -150,6 +162,12 @@ def main():
             len(missing), missing[:20] if missing else ""))
         print("    Stale docs (not in NDJSON)     : {:>5,d} {}".format(
             len(stale), stale[:20] if stale else ""))
+        no_passages = count_without_passages(es, args.index, source)
+        if no_passages is None:
+            print("    Passage vectors                : index has no nested 'passages' mapping —")
+            print("                                     delete it and recreate from index_template.json")
+        else:
+            print("    Docs without passage vectors   : {:>5,d}".format(no_passages))
 
     # Sources in the index that this NDJSON does not cover at all
     for source, count in sorted(sources_in_index(es, args.index).items()):
