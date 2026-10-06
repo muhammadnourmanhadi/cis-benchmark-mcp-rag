@@ -77,7 +77,7 @@ The parser is pre-configured for the following official CIS Benchmark PDFs. File
 
 | Source ID | File name |
 |---|---|
-| `windows_server_2025` *(opt-in)* | `CIS_Microsoft_Windows_Server_2025_Benchmark_v2.0.0.pdf` |
+| `windows_server_2025` | `CIS_Microsoft_Windows_Server_2025_Benchmark_v2.0.0.pdf` |
 | `windows_server_2022` | `CIS_Microsoft_Windows_Server_2022_Benchmark_v4.0.0.pdf` |
 | `windows_server_2019` | `CIS_Microsoft_Windows_Server_2019_Benchmark_v4.0.0.pdf` |
 | `windows_server_2016` | `CIS_Microsoft_Windows_Server_2016_Benchmark_v3.0.0.pdf` |
@@ -85,7 +85,7 @@ The parser is pre-configured for the following official CIS Benchmark PDFs. File
 | `rhel_8` | `CIS_Red_Hat_Enterprise_Linux_8_Benchmark_v4.0.0.pdf` |
 | `rhel_7` | `CIS_Red_Hat_Enterprise_Linux_7_Benchmark_v4.0.0.pdf` |
 
-`windows_server_2025` is **opt-in**: a default run skips it, even when its PDF is in the folder, so `output.ndjson` keeps the same benchmarks as before. Process it on its own with `--only windows_server_2025` (see [Running a single benchmark](#running-a-single-benchmark-eg-windows-server-2025)).
+A run without options processes every benchmark in this list whose PDF is present and writes them all to one `output.ndjson`. To process one benchmark on its own with separate output files, use `--only` (see [Running a single benchmark](#running-a-single-benchmark-eg-windows-server-2025)).
 
 > [!TIP]
 > To import other versions (e.g. RHEL 9 v2.1.0), update the entries in the `PDF_FILES` list at the top of [ingest_cis.py](1_parser_and_ingest/ingest_cis.py) to match your file names. Run with `--no-embed --strict` first to confirm the coverage report shows no missing rules.
@@ -143,7 +143,7 @@ python 1_parser_and_ingest/ingest_cis.py
 |---|---|
 | `--strict` | Exit with code 1 if any official recommendation has no body |
 | `--no-embed` | Skip embeddings (quick coverage check). No NDJSON is written unless `--output` is given |
-| `--only rhel_9 [...]` | Process only these sources (including opt-in ones). Writes `output.<source>.ndjson` and `coverage_report.<source>.json`, so the full run's files are never overwritten by a partial run |
+| `--only rhel_9 [...]` | Process only these sources. Writes `output.<source>.ndjson` and `coverage_report.<source>.json`, so the full run's files are never overwritten by a partial run |
 | `--pdf-dir`, `--output`, `--coverage-report` | Override the default paths |
 
 #### Running a single benchmark (e.g. Windows Server 2025)

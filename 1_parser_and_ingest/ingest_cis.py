@@ -84,10 +84,10 @@ except ImportError:
 SCRIPT_DIR  = Path(__file__).resolve().parent
 PDF_DIR     = SCRIPT_DIR / "cis_benchmarks"
 
-# Entries with "opt_in": True are skipped by a default run (which writes all
-# other benchmarks to one output.ndjson) and only processed when requested
-# with --only <source>, e.g. --only windows_server_2025 — that run writes its
-# own output.<source>.ndjson and coverage_report.<source>.json.
+# A default run processes every entry whose PDF exists and writes them all to
+# one output.ndjson. --only <source> (e.g. --only windows_server_2025)
+# processes just those entries and writes output.<source>.ndjson and
+# coverage_report.<source>.json instead.
 PDF_FILES = [
     # ── Windows Server ──────────────────────────────────────────────────
     {
@@ -97,7 +97,6 @@ PDF_FILES = [
         "os_name":   "Windows Server 2025",
         "benchmark": "CIS Microsoft Windows Server 2025 Benchmark",
         "version":   "v2.0.0",
-        "opt_in":    True,
     },
     {
         "filename":  "CIS_Microsoft_Windows_Server_2022_Benchmark_v4.0.0.pdf",
@@ -1150,11 +1149,7 @@ def main():
         print("         Run: pip install pypdf")
     print("=" * 60)
 
-    if args.only:
-        pdf_files = [e for e in PDF_FILES if e["source"] in args.only]
-    else:
-        # Default run: every benchmark except opt-in ones (e.g. Windows Server 2025)
-        pdf_files = [e for e in PDF_FILES if not e.get("opt_in")]
+    pdf_files = [e for e in PDF_FILES if not args.only or e["source"] in args.only]
 
     all_rules = []
     coverage_reports = []
