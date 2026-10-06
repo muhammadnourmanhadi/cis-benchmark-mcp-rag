@@ -33,6 +33,8 @@ MCP_PORT       = int(os.getenv("MCP_PORT", "8765"))
 MCP_HOST       = os.getenv("MCP_HOST",    "0.0.0.0")
 
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+PASSAGE_VECTOR_FIELD = "passages.vector"   # one vector per passage (nested)
+RULE_VECTOR_FIELD    = "text_embedding"    # one vector per rule (fallback)
 # ======================================================================
 
 logging.basicConfig(
@@ -88,6 +90,34 @@ def get_es():
         _es = Elasticsearch(**kwargs)
         log.info(f"Elasticsearch client initialized → {ES_HOST}")
     return _es
+
+
+_vector_field = None
+
+
+def get_vector_field() -> str:
+    """
+    Pick the kNN field from the index mapping (cached until a search fails,
+    so a recreated index is picked up): nested passage vectors
+    when the index has them (template with "passages" + ES 8.11+), otherwise
+    the single whole-rule vector of an index created before passages existed.
+    """
+    global _vector_field
+    if _vector_field is None:
+        # ES_INDEX may be an alias: use passages only if every index has them
+        mappings = get_es().indices.get_mapping(index=ES_INDEX).values()
+        if mappings and all(
+            m["mappings"].get("properties", {}).get("passages", {}).get("type") == "nested"
+            for m in mappings
+        ):
+            _vector_field = PASSAGE_VECTOR_FIELD
+        else:
+            _vector_field = RULE_VECTOR_FIELD
+            log.warning(f"Index '{ES_INDEX}' has no nested 'passages' mapping — "
+                        f"searching '{RULE_VECTOR_FIELD}' only. Recreate the index "
+                        f"from index_template.json to search full rule text.")
+        log.info(f"kNN search field: {_vector_field}")
+    return _vector_field
 
 
 # ======================================================================
@@ -175,32 +205,40 @@ def search_cis_benchmark(
     if os_filter:
         filters.append({"term": {"metadata.source": os_filter.strip().lower()}})
 
-    # Construct the Elasticsearch search payload using the new schema
-    knn_payload = {
-        "field": "text_embedding",
-        "query_vector": query_vector,
-        "k": top_k,
-        "num_candidates": top_k * 10
-    }
-
-    if filters:
-        knn_payload["filter"] = {
-            "bool": {
-                "filter": filters
-            }
+    # Construct the Elasticsearch kNN payload. Each rule is stored as one
+    # document with one vector per passage (nested "passages.vector"), so the
+    # whole rule text is searchable — not only the first 256 tokens. ES returns
+    # each matching rule once, scored by its best passage.
+    def build_knn(field):
+        payload = {
+            "field": field,
+            "query_vector": query_vector,
+            "k": top_k,
+            "num_candidates": max(top_k * 10, 50)
         }
+        if filters:
+            payload["filter"] = {
+                "bool": {
+                    "filter": filters
+                }
+            }
+        return payload
+
+    source_fields = [
+        "rule_id", "rule_title", "metadata.profile_applicability",
+        "sections.audit_text", "sections.remediation_text", "metadata.source"
+    ]
 
     es = get_es()
     try:
         response = es.search(
             index=ES_INDEX,
-            knn=knn_payload,
-            source=[
-                "rule_id", "rule_title", "metadata.profile_applicability", 
-                "sections.audit_text", "sections.remediation_text", "metadata.source"
-            ]
+            knn=build_knn(get_vector_field()),
+            source=source_fields
         )
     except Exception as e:
+        global _vector_field
+        _vector_field = None   # re-read the mapping next time (e.g. index recreated)
         log.error(f"Elasticsearch search failed: {e}")
         return {
             "error": str(e),

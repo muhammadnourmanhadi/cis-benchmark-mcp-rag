@@ -17,8 +17,12 @@ Configuration (environment variables, same as the MCP server):
     ES_HOST         default https://127.0.0.1:9200
     ES_USER / ES_PASSWORD
     ES_FINGERPRINT  SHA-256 fingerprint of the ES HTTP certificate
-    ES_CA_CERT      path to the ES CA certificate (alternative to fingerprint)
+    ES_CA_CERT      path to the ES HTTP CA certificate (takes precedence over
+                    ES_FINGERPRINT; use it when the cluster does not send its CA)
     ES_INDEX        default cis_benchmark
+
+Values not exported in the shell are read from 3_mcp_server/.env (or --env-file),
+so the same settings as the MCP server work without re-typing them.
 
 Dependencies:
     pip install "elasticsearch>=8.0.0,<10.0.0"
@@ -29,13 +33,125 @@ Usage:
 """
 
 import os
+import re
+import ssl
 import sys
 import json
+import socket
+import hashlib
+import subprocess
 import argparse
+from urllib.parse import urlparse
 from pathlib import Path
 from collections import OrderedDict
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_ENV_FILE = SCRIPT_DIR.parent / "3_mcp_server" / ".env"
+
+
+def load_env_file(path):
+    """
+    Load KEY=VALUE pairs from an .env file (the MCP server's by default).
+    Variables already set in the environment win over the file.
+    """
+    if not path or not Path(path).is_file():
+        return False
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            if key.startswith("export "):
+                key = key[len("export "):].strip()
+            value = value.strip().strip('"').strip("'")
+            if key and value and key not in os.environ:
+                os.environ[key] = value
+    return True
+
+
+class FingerprintMismatch(Exception):
+    """ES_FINGERPRINT matches none of the certificates the cluster sends."""
+
+    def __init__(self, presented, chain_read=True):
+        super().__init__("Fingerprints did not match")
+        self.presented = presented
+        self.chain_read = chain_read
+
+
+def _chain_via_openssl_cli(hostname, port):
+    """
+    Read the certificates the server sends with the openssl CLI. Used on
+    Python < 3.10, whose ssl module cannot return the peer's chain.
+    """
+    try:
+        out = subprocess.run(
+            ["openssl", "s_client", "-connect", "{}:{}".format(hostname, port),
+             "-servername", hostname, "-showcerts"],
+            input=b"", capture_output=True, timeout=15,
+        ).stdout.decode("ascii", "replace")
+    except (OSError, subprocess.SubprocessError):
+        return []
+    pems = re.findall(r"-----BEGIN CERTIFICATE-----.+?-----END CERTIFICATE-----", out, re.S)
+    return [ssl.PEM_cert_to_DER_cert(pem) for pem in pems]
+
+
+def presented_chain(host):
+    """
+    Return (certificates the server actually sends as DER, leaf first;
+    whether the full chain could be read). Read without verification, so it
+    does not depend on the private "verified chain" APIs elastic_transport
+    uses, whose result differs between Python/OpenSSL versions (and which do
+    not exist at all before Python 3.10).
+    """
+    url = urlparse(host)
+    port = url.port or (443 if url.scheme == "https" else 80)   # same default as the ES client
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    chain = []
+    with socket.create_connection((url.hostname, port), timeout=15) as raw:
+        with ctx.wrap_socket(raw, server_hostname=url.hostname) as tls:
+            leaf = tls.getpeercert(True)
+            try:
+                if hasattr(tls, "get_unverified_chain"):            # Python 3.13+
+                    chain = [bytes(c) for c in tls.get_unverified_chain()]
+                elif hasattr(tls._sslobj, "get_unverified_chain"):  # Python 3.10-3.12
+                    chain = [c.public_bytes(ssl._ssl.ENCODING_DER)
+                             for c in tls._sslobj.get_unverified_chain()]
+            except Exception:
+                chain = []
+    if not chain:                                                   # Python < 3.10
+        chain = _chain_via_openssl_cli(url.hostname, port)
+    chain_read = bool(chain)
+    if not chain or chain[0] != leaf:
+        chain.insert(0, leaf)
+    return chain, chain_read
+
+
+def fingerprint_tls(host, fingerprint):
+    """
+    Resolve ES_FINGERPRINT against the certificates the server sends:
+      - matches the server certificate -> pin it (ssl_assert_fingerprint)
+      - matches a CA in the chain       -> verify the chain against that CA
+    """
+    wanted = fingerprint.replace(":", "").strip().lower()
+    chain, chain_read = presented_chain(host)
+    prints = [hashlib.sha256(der).hexdigest() for der in chain]
+    if wanted == prints[0]:
+        return {"ssl_assert_fingerprint": wanted}, "server certificate fingerprint (ES_FINGERPRINT)"
+    if wanted in prints[1:]:
+        ca_pem = ssl.DER_cert_to_PEM_cert(chain[prints.index(wanted)])
+        ctx = ssl.create_default_context(cadata=ca_pem)
+        # Pinned private CA: same trust model as a fingerprint, so no hostname
+        # check (the ES_HOST name/IP may not be in the certificate SANs).
+        ctx.check_hostname = False
+        # Python 3.13 enables strict X.509 checks that some self-signed
+        # Elasticsearch CAs fail (e.g. missing key usage extension).
+        ctx.verify_flags &= ~getattr(ssl, "VERIFY_X509_STRICT", 0)
+        return {"ssl_context": ctx}, "CA fingerprint (ES_FINGERPRINT), CA taken from the TLS chain"
+    raise FingerprintMismatch(prints, chain_read)
 
 
 def get_es():
@@ -45,13 +161,24 @@ def get_es():
         print("ERROR: elasticsearch is not installed. Run: pip install \"elasticsearch>=8.0.0,<10.0.0\"")
         sys.exit(1)
 
-    kwargs = {"hosts": [os.getenv("ES_HOST", "https://127.0.0.1:9200")], "request_timeout": 60}
-    if os.getenv("ES_FINGERPRINT"):
-        kwargs["ssl_assert_fingerprint"] = os.getenv("ES_FINGERPRINT")
-    elif os.getenv("ES_CA_CERT"):
+    host = os.getenv("ES_HOST", "https://127.0.0.1:9200")
+    kwargs = {"hosts": [host], "request_timeout": 60}
+    print("  Elasticsearch : {}".format(host))
+    print("  Python/OpenSSL: {} / {}".format(sys.version.split()[0], ssl.OPENSSL_VERSION))
+    if os.getenv("ES_CA_CERT"):
+        # The CA file wins over a fingerprint: it does not depend on the cluster
+        # sending its CA in the TLS chain, and survives certificate renewal.
         kwargs["ca_certs"] = os.getenv("ES_CA_CERT")
+        tls = "CA certificate {} (ES_CA_CERT)".format(os.getenv("ES_CA_CERT"))
+    elif os.getenv("ES_FINGERPRINT") and host.startswith("https"):
+        extra, tls = fingerprint_tls(host, os.getenv("ES_FINGERPRINT"))
+        kwargs.update(extra)
+    else:
+        tls = "system CA store (set ES_FINGERPRINT or ES_CA_CERT for a self-signed cluster)"
     if os.getenv("ES_USER") and os.getenv("ES_PASSWORD"):
         kwargs["basic_auth"] = (os.getenv("ES_USER"), os.getenv("ES_PASSWORD"))
+    if host.startswith("https"):
+        print("  TLS verify    : {}".format(tls))
     return Elasticsearch(**kwargs)
 
 
@@ -77,6 +204,22 @@ def ids_in_index(es, index, doc_ids):
         resp = es.mget(index=index, ids=doc_ids[i:i + 500], source=False)
         found.update(d["_id"] for d in resp["docs"] if d.get("found"))
     return found
+
+
+def has_nested_passages(es, index):
+    """True if every index behind the name maps "passages" as nested."""
+    mappings = es.indices.get_mapping(index=index).values()
+    return all(m["mappings"].get("properties", {}).get("passages", {}).get("type") == "nested"
+               for m in mappings)
+
+
+def count_without_passages(es, index, source):
+    """Documents of one source that have no passage vectors (full-text search misses them)."""
+    query = {"bool": {
+        "filter": [{"term": {"metadata.source": source}}],
+        "must_not": [{"nested": {"path": "passages", "query": {"exists": {"field": "passages.vector"}}}}],
+    }}
+    return es.count(index=index, query=query)["count"]
 
 
 def ids_for_source(es, index, source):
@@ -107,8 +250,15 @@ def main():
     parser = argparse.ArgumentParser(description="Verify CIS rules in Elasticsearch")
     parser.add_argument("--ndjson", type=Path, default=SCRIPT_DIR / "output.ndjson")
     parser.add_argument("--coverage-report", type=Path, default=SCRIPT_DIR / "coverage_report.json")
-    parser.add_argument("--index", default=os.getenv("ES_INDEX", "cis_benchmark"))
+    parser.add_argument("--env-file", type=Path, default=DEFAULT_ENV_FILE,
+                        help="Read ES_* settings from this file when they are not exported "
+                             "(default: %(default)s)")
+    parser.add_argument("--index", default=None)
     args = parser.parse_args()
+
+    if load_env_file(args.env_file):
+        print("  Env file      : {}".format(args.env_file))
+    args.index = args.index or os.getenv("ES_INDEX", "cis_benchmark")
 
     if not args.ndjson.is_file():
         print("ERROR: {} not found — run ingest_cis.py first.".format(args.ndjson))
@@ -119,14 +269,60 @@ def main():
         with open(args.coverage_report, "r", encoding="utf-8") as f:
             coverage = {c["source"]: c for c in json.load(f)}
 
-    es = get_es()
     by_source = load_ndjson(args.ndjson)
     total_gaps = 0
 
-    if not es.indices.exists(index=args.index):
+    try:
+        es = get_es()
+        index_exists = es.indices.exists(index=args.index)
+    except (OSError, ConnectionError) as e:
+        print("ERROR: cannot connect to {}: {}".format(os.getenv("ES_HOST", "https://127.0.0.1:9200"), e))
+        print("  Check that Elasticsearch is running and ES_HOST (scheme, host, port) is correct.")
+        return 1
+    except Exception as e:
+        if type(e).__name__ in ("ConnectionError", "ConnectionTimeout") and "TLS" not in str(e):
+            print("ERROR: cannot connect to {}: {}".format(os.getenv("ES_HOST", "https://127.0.0.1:9200"), e))
+            print("  Check that Elasticsearch is running and ES_HOST (scheme, host, port) is correct.")
+            return 1
+        if isinstance(e, FingerprintMismatch) or "Fingerprints did not match" in str(e):
+            presented = getattr(e, "presented", None) or \
+                re.findall(r'"([0-9a-fA-F:]{40,})"', str(e))[1:]
+            print("ERROR: ES_FINGERPRINT does not match any certificate the cluster sends.")
+            print("  ES_FINGERPRINT       : {}".format(os.getenv("ES_FINGERPRINT")))
+            print("  Cluster presents     : {}".format(", ".join(presented) or "?"))
+            if len(presented) == 1 and not getattr(e, "chain_read", True):
+                print("  Python {} cannot read the certificate chain (needs 3.10+) and the".format(
+                    sys.version.split()[0]))
+                print("  openssl CLI was not available, so only the server certificate was")
+                print("  compared. Use Python 3.10+ for this venv, or one of:")
+            elif len(presented) == 1:
+                print("  The cluster sends only its own certificate, not the CA chain, so a CA")
+                print("  fingerprint can never match. Use one of:")
+                print("    1. Verify against the CA file (recommended, survives cert renewal):")
+                print("         ES_CA_CERT=/path/to/http_ca.crt   (copy of /etc/elasticsearch/certs/http_ca.crt)")
+                print("       and remove ES_FINGERPRINT.")
+                print("    2. Pin the certificate the cluster presents (changes when it is renewed):")
+                print("         ES_FINGERPRINT={}".format(presented[0]))
+            return 1
+        if "CERTIFICATE_VERIFY_FAILED" in str(e):
+            print("ERROR: TLS certificate verification failed — the cluster uses a self-signed CA.")
+            print("  Set ES_FINGERPRINT (HTTP CA SHA-256 fingerprint) or ES_CA_CERT, either")
+            print("  exported in this shell (export ES_FINGERPRINT=...) or in {}.".format(args.env_file))
+            print("  Get the fingerprint with:")
+            print("    openssl x509 -fingerprint -sha256 -noout -in /etc/elasticsearch/certs/http_ca.crt")
+            return 1
+        raise
+    if not index_exists:
         print("ERROR: index '{}' does not exist — register the template and run Logstash.".format(
             args.index))
         return 1
+
+    nested = has_nested_passages(es, args.index)
+    total_no_passages = 0
+    if not nested:
+        print("\n  WARNING: index '{}' has no nested 'passages' mapping — the MCP server can".format(args.index))
+        print("  only search the single text_embedding vector. Delete the index, re-register")
+        print("  index_template.json (Elasticsearch 8.11+) and re-run Logstash.")
 
     print("=" * 60)
     print("  Elasticsearch coverage check — index: {}".format(args.index))
@@ -150,6 +346,10 @@ def main():
             len(missing), missing[:20] if missing else ""))
         print("    Stale docs (not in NDJSON)     : {:>5,d} {}".format(
             len(stale), stale[:20] if stale else ""))
+        if nested:
+            no_passages = count_without_passages(es, args.index, source)
+            total_no_passages += no_passages
+            print("    Docs without passage vectors   : {:>5,d}".format(no_passages))
 
     # Sources in the index that this NDJSON does not cover at all
     for source, count in sorted(sources_in_index(es, args.index).items()):
@@ -163,9 +363,14 @@ def main():
         print("  (mapping errors) and re-run the pipeline.")
     else:
         print("  RESULT: every rule in output.ndjson is in the index.")
+    if not nested or total_no_passages:
+        print("  PASSAGES: {} — full-text vector search is incomplete. Re-run ingest_cis.py".format(
+            "index has no nested mapping" if not nested
+            else "{} doc(s) without passage vectors".format(total_no_passages)))
+        print("  (without --no-embed) and reindex from index_template.json.")
     print("  Stale docs: delete the index, re-register the template, re-run Logstash.")
     print("=" * 60)
-    return 1 if total_gaps else 0
+    return 1 if total_gaps or not nested or total_no_passages else 0
 
 
 if __name__ == "__main__":

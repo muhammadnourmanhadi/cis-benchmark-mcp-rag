@@ -7,7 +7,7 @@ A production-ready **Hybrid RAG (Retrieval-Augmented Generation)** framework des
 Relying solely on vector search (*dense retrieval*) often fails on technical manuals due to lack of exact constraints, while standard keyword filters (*sparse retrieval*) lack semantic intent. This project implements a true **Hybrid RAG** by merging:
 
 1. **Document-per-Rule Structure-Aware Chunking**: The custom parser [ingest_cis.py](1_parser_and_ingest/ingest_cis.py) extracts each CIS rule as a **single, undivided JSON document** in `output.ndjson`, preserving the complete context of the title, audit checks, and remediation.
-2. **Dense Retrieval (Semantic Search)**: Rules are embedded as 384-dimensional vectors (`sentence-transformers`), resolving natural language synonyms (e.g., matching "password age" to "expiration policies").
+2. **Dense Retrieval (Semantic Search)**: Rules are embedded as 384-dimensional vectors (`sentence-transformers`), resolving natural language synonyms (e.g., matching "password age" to "expiration policies"). Each rule is split into passages that fit the model's 256-token window and every passage gets its own vector, so the **whole** rule (description, audit, remediation) is searchable — not just its first ~1,000 characters.
 3. **Structured Boolean Filtering**: Queries are hard-filtered in Elasticsearch using metadata criteria (Target OS, CIS Level, Profile, Automation).
 
 This **Hybrid Integration** ensures that querying *"password policy"* restricted to **RHEL 9, Level 1** dynamically intersects vector similarity with exact constraints. It prevents LLMs from hallucinating and serving Windows GPO guidelines to a Linux host, guaranteeing 100% accurate, undivided, and version-specific context in a single query. 
@@ -37,7 +37,9 @@ This **Hybrid Integration** ensures that querying *"password policy"* restricted
 ```text
 ├── 1_parser_and_ingest/       # PDF Extraction & Ingestion Pipeline
 │   ├── cis_benchmarks/        # Place your downloaded official CIS PDFs here (gitignored)
-│   └── ingest_cis.py          # State-machine parser and vector embedding generator
+│   ├── ingest_cis.py          # State-machine parser and vector embedding generator
+│   ├── verify_es_coverage.py  # Checks every parsed rule reached Elasticsearch
+│   └── requirements_ingest.txt # Ingestion dependencies (install CPU torch first)
 │
 ├── 2_elasticsearch_config/    # Database Schema Mapping & Logstash Pipelines
 │   ├── index_template.json    # ES mapping template with dense_vector schema configurations
@@ -61,7 +63,7 @@ To set up and run this project, your environment must satisfy the following:
 
 1. **Python Runtime**: Python 3.10+ (Python 3.11/3.12 recommended).
 2. **PyTorch & Transformers Setup**: System memory of at least 8GB RAM is recommended to run local embedding models (`all-MiniLM-L6-v2`).
-3. **Database**: Elasticsearch instance with k-NN/vector search enabled.
+3. **Database**: Elasticsearch **8.11 or newer** with k-NN/vector search enabled. The index template maps an indexed `dense_vector` inside the nested `passages` field, which older versions reject. (The MCP server still falls back to the single `text_embedding` vector for an index created before `passages` existed.)
 4. **Logstash Ingestion Pipeline**: Logstash instance configured with [cis_benchmark.conf](2_elasticsearch_config/cis_benchmark.conf) to stream NDJSON records into Elasticsearch.
 5. **Docker**: Docker Engine & Docker Compose installed for running the MCP server container.
 
@@ -104,7 +106,13 @@ python -m venv venv
 source venv/bin/activate
 
 # Install ingestion dependencies
-pip install pdfplumber pypdf sentence-transformers torch
+# CPU-only PyTorch first (the default Linux wheel is the CUDA build, ~1.5 GB with nvidia-* packages).
+# Skip this line if you have an NVIDIA GPU and want to embed on it.
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install -r 1_parser_and_ingest/requirements_ingest.txt
+
+# Only checking parsing/coverage (--no-embed)? This is all you need (~75 MB, no torch):
+# pip install pdfplumber pypdf
 ```
 
 ### Step 2: Download CIS Benchmarks PDF
@@ -131,7 +139,9 @@ The script performs the following pipeline in sequence:
 4. **Candidate Selection & Recovery**: Keeps the most complete candidate per rule (with Profile Applicability / Description / Audit / Remediation), drops IDs that are not official recommendations, and rebuilds any official rule the state machine missed by locating its ID in the body pages (`metadata.parse_method = "recovered"`).
 5. **Coverage Report**: Prints expected vs parsed counts per PDF and lists recovered, dropped and missing rules. Saved to `1_parser_and_ingest/coverage_report.json`.
 6. **Post-Processing**: Extracts structured fields from raw content using regex: `sections.audit_text`, `sections.remediation_text`, `metadata.profile_applicability`, and backfills `metadata.cis_level` for RHEL rules from Profile Applicability text.
-7. **Batch Embedding**: Generates 384-dimensional normalized vectors using `all-MiniLM-L6-v2` in configurable batch sizes (default: 64).
+7. **Passage Embedding**: `all-MiniLM-L6-v2` only reads 256 tokens, while a CIS rule averages ~3,600 characters. Each rule is split into passages that fit the window (each starts with `rule_id + title`, with ~32 tokens of overlap), and every passage is embedded in batches (default: 64). Each document gets:
+   * `passages[]` — `{chunk_id, vector}` per passage, searched with nested kNN by the MCP server (each rule is returned once, scored by its best passage).
+   * `text_embedding` — normalized mean of the passage vectors, a single-vector fallback that covers the whole rule.
 8. **Quality Report**: Prints per-OS rule counts, CIS Level distribution, automation status breakdown, section extraction coverage percentages, and content length statistics.
 
 This generates:
@@ -141,7 +151,13 @@ This generates:
 ### Step 4: Register Index Template in Elasticsearch
 
 > [!IMPORTANT]
-> **Register the index template BEFORE streaming data via Logstash.** This ensures Elasticsearch maps the `text_embedding` field as a `dense_vector` type rather than dynamically indexing it as an auto-detected float list.
+> **Register the index template BEFORE streaming data via Logstash.** This ensures Elasticsearch maps `text_embedding` and the nested `passages.vector` fields as `dense_vector` types rather than dynamically indexing them as auto-detected float lists.
+
+> [!WARNING]
+> An index template only applies to **newly created** indices. If `cis_benchmark` already exists (for example from a run before the nested `passages` field was added), delete it first — otherwise `passages` is mapped as a plain object and the MCP server can only search the single `text_embedding` vector.
+> ```bash
+> curl -X DELETE "https://YOUR_ES_HOST:9200/cis_benchmark"
+> ```
 
 Apply the custom index template to your Elasticsearch instance:
 ```bash
@@ -189,6 +205,8 @@ pip install "elasticsearch>=8.0.0,<10.0.0"
 ES_HOST=https://127.0.0.1:9200 ES_USER=elastic ES_PASSWORD=... ES_FINGERPRINT=... \
   python 1_parser_and_ingest/verify_es_coverage.py
 ```
+Settings that are not exported in the shell are read from `3_mcp_server/.env`, so the MCP server's configuration works as is (use `--env-file` for another file). For a self-signed cluster set `ES_FINGERPRINT` to the HTTP CA fingerprint (`openssl x509 -fingerprint -sha256 -noout -in /etc/elasticsearch/certs/http_ca.crt`) or `ES_CA_CERT` to the CA file.
+
 It lists rules in `output.ndjson` that are missing from the index and stale documents in the index that are not in `output.ndjson`.
 
 ### Step 6: Configure and Deploy the MCP Server

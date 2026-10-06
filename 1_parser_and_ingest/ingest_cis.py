@@ -18,8 +18,10 @@ Architecture:
          →  Recovery pass for recommendations still missing
          →  Coverage report (expected vs parsed, per benchmark)
          →  Post-Processing (regex extraction of sections & metadata)
-         →  Batch Embedding (sentence-transformers/all-MiniLM-L6-v2)
-         →  NDJSON output (one document per CIS rule + text_embedding)
+         →  Passage Embedding (sentence-transformers/all-MiniLM-L6-v2): every rule
+            is split into passages that fit the 256-token window, so the whole
+            rule is embedded instead of only its first 256 tokens
+         →  NDJSON output (one document per CIS rule + passages[] + text_embedding)
 
 Key Architecture Benefit:
     Each parsed CIS rule corresponds directly to 1 complete JSON document. This preserves context integrity and prevents critical information from being split mid-sentence.
@@ -37,7 +39,9 @@ Output:
     1_parser_and_ingest/coverage_report.json  — Expected vs parsed rules per benchmark
 
 Dependencies:
-    pip install pdfplumber pypdf sentence-transformers torch
+    pip install torch --index-url https://download.pytorch.org/whl/cpu   (CPU-only, smaller)
+    pip install -r 1_parser_and_ingest/requirements_ingest.txt
+    (--no-embed only needs: pip install pdfplumber pypdf)
 
 Usage:
     python 1_parser_and_ingest/ingest_cis.py              # parse + embed all PDFs
@@ -140,6 +144,7 @@ COVERAGE_REPORT = SCRIPT_DIR / "coverage_report.json"
 EMBEDDING_MODEL  = "sentence-transformers/all-MiniLM-L6-v2"
 EMBEDDING_DIMS   = 384
 BATCH_SIZE_EMBED = 64     # Reduce if RAM runs out
+PASSAGE_OVERLAP_TOKENS = 32   # Context repeated between consecutive passages
 
 
 # ======================================================================
@@ -855,6 +860,9 @@ def print_statistics(all_rules):
         has_profile, total, has_profile / total * 100))
     print("    text_embedding          {:>5,d} / {:,d} ({:.1f}%)".format(
         has_embed, total, has_embed / total * 100))
+    total_passages = sum(len(r.get("passages", [])) for r in all_rules)
+    print("    passages (vectors)      {:>5,d} for {:,d} rules ({:.1f} per rule)".format(
+        total_passages, total, total_passages / total))
 
     # ── Content length stats ──
     lengths = [len(r["content_for_vector"]) for r in all_rules]
@@ -925,52 +933,181 @@ def parse_args():
     return args
 
 
+def _token_count(tokenizer, text):
+    return len(tokenizer.encode(text, add_special_tokens=False))
+
+
+def _passage_header(rule):
+    """'<rule_id> (<level>) <title> (<status>)' — same wording as the rule header."""
+    meta = rule["metadata"]
+    return " ".join(part for part in (
+        rule["rule_id"],
+        "({})".format(meta["cis_level"]) if meta.get("cis_level") else "",
+        rule["rule_title"],
+        "({})".format(meta["automation_status"]) if meta.get("automation_status") else "",
+    ) if part)
+
+
+def _split_long_line(line, tokenizer, budget):
+    """
+    Cut a line longer than the budget at word boundaries, keeping the
+    original text. A single word longer than the budget is cut by tokens.
+    """
+    pieces = []
+    words, words_len = [], 0
+    for word in line.split(" "):
+        n = _token_count(tokenizer, word)
+        if n > budget:
+            if words:
+                pieces.append((" ".join(words), words_len))
+                words, words_len = [], 0
+            ids = tokenizer.encode(word, add_special_tokens=False)
+            i = 0
+            while i < len(ids):
+                # A decoded wordpiece slice ("##abc") can re-tokenize to more
+                # tokens than the slice, so shrink it until it fits the budget.
+                step = budget
+                while True:
+                    piece = tokenizer.decode(ids[i:i + step])
+                    n_piece = _token_count(tokenizer, piece)
+                    if n_piece <= budget or step == 1:
+                        break
+                    step = max(1, step - (n_piece - budget))
+                pieces.append((piece, n_piece))
+                i += step
+            continue
+        if words and words_len + n > budget:
+            pieces.append((" ".join(words), words_len))
+            words, words_len = [], 0
+        words.append(word)
+        words_len += n
+    if words:
+        pieces.append((" ".join(words), words_len))
+    return pieces
+
+
+def split_passages(rule, tokenizer, max_tokens):
+    """
+    Split a rule's full text into passages that fit the embedding model's
+    token window, so no part of the rule is truncated away.
+
+    Every passage starts with the rule header (ID, level, title, status) so it
+    keeps its context, is packed line by line (lines longer than the budget are
+    cut at word boundaries), and repeats up to PASSAGE_OVERLAP_TOKENS from the
+    end of the previous passage when that still fits the budget.
+    """
+    # [CLS] + [SEP] + newline + safety margin for re-tokenization of joined lines
+    reserved = 8
+    header = _passage_header(rule)
+    header_ids = tokenizer.encode(header, add_special_tokens=False)
+    if len(header_ids) > max_tokens // 2:
+        # Extremely long title: shorten the header, never the content
+        header = tokenizer.decode(header_ids[:max_tokens // 2])
+        header_ids = tokenizer.encode(header, add_special_tokens=False)
+    budget = max_tokens - len(header_ids) - reserved
+
+    lines = []
+    for line in rule["content_for_vector"].split("\n")[1:]:   # line 0 = header
+        line = line.strip()
+        if not line:
+            continue
+        n = _token_count(tokenizer, line)
+        if n <= budget:
+            lines.append((line, n))
+        else:
+            lines.extend(_split_long_line(line, tokenizer, budget))
+
+    passages = []
+    current, current_len = [], 0
+    for line, n in lines:
+        if current and current_len + n > budget:
+            passages.append(current)
+            # Overlap: carry the tail of the previous passage forward, but never
+            # the whole passage and never more than the next line leaves room for
+            carry, carry_len = [], 0
+            for prev_line, prev_n in reversed(current[1:]):
+                if carry_len + prev_n > min(PASSAGE_OVERLAP_TOKENS, budget - n):
+                    break
+                carry.insert(0, (prev_line, prev_n))
+                carry_len += prev_n
+            current, current_len = carry, carry_len
+        current.append((line, n))
+        current_len += n
+    if current or not passages:
+        passages.append(current)
+
+    return [header + ("\n" + "\n".join(l for l, _ in p) if p else "") for p in passages]
+
+
 def embed_rules(all_rules):
-    """Generate normalized embeddings for every rule (in place)."""
+    """
+    Generate normalized embeddings for every rule (in place).
+
+    all-MiniLM-L6-v2 only reads its first 256 tokens, while a CIS rule is
+    often 1,000-3,000 tokens. Each rule is therefore split into passages
+    that fit the window and every passage is embedded:
+      - rule["passages"]       — [{chunk_id, vector}] for nested kNN search
+      - rule["text_embedding"] — normalized mean of the passage vectors
+                                 (single-vector fallback covering the whole rule)
+    """
     try:
+        import numpy as np
         from sentence_transformers import SentenceTransformer
     except ImportError:
         print("=" * 60)
         print("  ERROR: sentence-transformers is not installed.")
-        print("  Run: pip install sentence-transformers torch")
+        print("  Run: pip install torch --index-url https://download.pytorch.org/whl/cpu")
+        print("       pip install sentence-transformers")
         print("=" * 60)
         sys.exit(1)
 
     print("\n" + "-" * 60)
     print("  [EMBED] Loading model: {} ...".format(EMBEDDING_MODEL))
     model = SentenceTransformer(EMBEDDING_MODEL)
-    print("  [EMBED] Model loaded ({} dimensions)".format(EMBEDDING_DIMS))
+    max_tokens = model.max_seq_length
+    print("  [EMBED] Model loaded ({} dimensions, {} token window)".format(
+        EMBEDDING_DIMS, max_tokens))
 
-    texts = [r["content_for_vector"] for r in all_rules]
-    total_rules = len(texts)
-    total_batches = (total_rules + BATCH_SIZE_EMBED - 1) // BATCH_SIZE_EMBED
+    # ── Split every rule into passages that fit the token window ──
+    rule_passages = [split_passages(r, model.tokenizer, max_tokens) for r in all_rules]
+    texts = [t for passages in rule_passages for t in passages]
+    total = len(texts)
+    counts = [len(p) for p in rule_passages]
+    print("  [EMBED] {:,d} rules -> {:,d} passages (avg {:.1f}, max {} per rule)".format(
+        len(all_rules), total, total / len(all_rules), max(counts)))
 
-    print("  [EMBED] Encoding {:,d} rules in {} batches (batch_size={})...".format(
-        total_rules, total_batches, BATCH_SIZE_EMBED
+    total_batches = (total + BATCH_SIZE_EMBED - 1) // BATCH_SIZE_EMBED
+    print("  [EMBED] Encoding {:,d} passages in {} batches (batch_size={})...".format(
+        total, total_batches, BATCH_SIZE_EMBED
     ))
 
     all_embeddings = []
-    for i in range(0, total_rules, BATCH_SIZE_EMBED):
+    for i in range(0, total, BATCH_SIZE_EMBED):
         batch_num = (i // BATCH_SIZE_EMBED) + 1
-        batch_texts = texts[i : i + BATCH_SIZE_EMBED]
         vectors = model.encode(
-            batch_texts,
+            texts[i : i + BATCH_SIZE_EMBED],
             show_progress_bar=False,
             normalize_embeddings=True,
         )
         all_embeddings.extend(vectors.tolist())
 
         if batch_num % 10 == 0 or batch_num == total_batches:
-            print("    Batch {}/{} done ({:,d}/{:,d} rules)".format(
-                batch_num, total_batches,
-                min(i + BATCH_SIZE_EMBED, total_rules), total_rules
+            print("    Batch {}/{} done ({:,d}/{:,d} passages)".format(
+                batch_num, total_batches, min(i + BATCH_SIZE_EMBED, total), total
             ))
 
-    # Assign embeddings to each rule
-    for rule, embedding in zip(all_rules, all_embeddings):
-        rule["text_embedding"] = embedding
+    # ── Assign passage vectors and the whole-rule mean vector ──
+    pos = 0
+    for rule, passages in zip(all_rules, rule_passages):
+        vectors = all_embeddings[pos:pos + len(passages)]
+        pos += len(passages)
+        rule["passages"] = [
+            {"chunk_id": i, "vector": vector} for i, vector in enumerate(vectors)
+        ]
+        mean = np.mean(np.array(vectors), axis=0)
+        rule["text_embedding"] = (mean / (np.linalg.norm(mean) or 1.0)).tolist()
 
-    print("  [EMBED] All {:,d} embeddings generated successfully.".format(total_rules))
+    print("  [EMBED] All {:,d} passages embedded for {:,d} rules.".format(total, len(all_rules)))
 
 
 def main():

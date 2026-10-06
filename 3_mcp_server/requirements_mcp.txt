@@ -1,6 +1,14 @@
 # requirements untuk cis_mcp_server_http.py
-mcp[cli]>=1.9.0
-fastmcp>=2.0.0
+#
+# torch is NOT listed here: Dockerfile.mcp installs the CPU-only build from
+# https://download.pytorch.org/whl/cpu first. The default PyPI torch wheel on
+# Linux is the CUDA build (~555 MB) and pulls >1 GB of nvidia-* packages that
+# a CPU container never uses. For a local run without Docker:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   pip install -r requirements_mcp.txt
+#
+# mcp 2.x renamed FastMCP to MCPServer (mcp.server.fastmcp no longer exists);
+# this server is written against the 1.x API. mcp already depends on uvicorn.
+mcp>=1.9.0,<2
 sentence-transformers>=3.0.0
 elasticsearch>=8.0.0,<10.0.0
-uvicorn>=0.30.0
