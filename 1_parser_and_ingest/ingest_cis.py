@@ -39,7 +39,8 @@ Output:
     1_parser_and_ingest/coverage_report.json  — Expected vs parsed rules per benchmark
 
 Dependencies:
-    pip install pdfplumber pypdf sentence-transformers torch
+    pip install torch --index-url https://download.pytorch.org/whl/cpu   (CPU-only, smaller)
+    pip install pdfplumber pypdf sentence-transformers
 
 Usage:
     python 1_parser_and_ingest/ingest_cis.py              # parse + embed all PDFs
@@ -1044,7 +1045,8 @@ def embed_rules(all_rules):
     except ImportError:
         print("=" * 60)
         print("  ERROR: sentence-transformers is not installed.")
-        print("  Run: pip install sentence-transformers torch")
+        print("  Run: pip install torch --index-url https://download.pytorch.org/whl/cpu")
+        print("       pip install sentence-transformers")
         print("=" * 60)
         sys.exit(1)
 

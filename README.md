@@ -104,7 +104,10 @@ python -m venv venv
 source venv/bin/activate
 
 # Install ingestion dependencies
-pip install pdfplumber pypdf sentence-transformers torch
+# CPU-only PyTorch first (the default Linux wheel is the CUDA build, ~1.5 GB with nvidia-* packages).
+# Skip this line if you have an NVIDIA GPU and want to embed on it.
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install pdfplumber pypdf sentence-transformers
 ```
 
 ### Step 2: Download CIS Benchmarks PDF
