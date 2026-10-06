@@ -129,7 +129,7 @@ mcp = FastMCP(
     port=MCP_PORT,
     instructions=(
         "This server provides access to the CIS Benchmark database "
-        "(Windows Server 2016/2019/2022 and RHEL 7/8/9). "
+        "(Windows Server 2016/2019/2022/2025 and RHEL 7/8/9). "
         "Routing guide: "
         "(1) Rule CONTENT / detailed guidance queries → use search_cis_benchmark. "
         "(2) Rule COUNT / total rules queries → use count_cis_rules. "

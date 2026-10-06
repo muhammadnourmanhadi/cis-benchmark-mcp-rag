@@ -48,6 +48,8 @@ Usage:
     python 1_parser_and_ingest/ingest_cis.py --strict     # exit 1 if any rule is missing
     python 1_parser_and_ingest/ingest_cis.py --no-embed   # quick coverage check, no embeddings
     python 1_parser_and_ingest/ingest_cis.py --only rhel_9
+    python 1_parser_and_ingest/ingest_cis.py --only windows_server_2025
+        # -> output.windows_server_2025.ndjson + coverage_report.windows_server_2025.json
 """
 
 import re
@@ -82,8 +84,21 @@ except ImportError:
 SCRIPT_DIR  = Path(__file__).resolve().parent
 PDF_DIR     = SCRIPT_DIR / "cis_benchmarks"
 
+# Entries with "opt_in": True are skipped by a default run (which writes all
+# other benchmarks to one output.ndjson) and only processed when requested
+# with --only <source>, e.g. --only windows_server_2025 — that run writes its
+# own output.<source>.ndjson and coverage_report.<source>.json.
 PDF_FILES = [
     # ── Windows Server ──────────────────────────────────────────────────
+    {
+        "filename":  "CIS_Microsoft_Windows_Server_2025_Benchmark_v2.0.0.pdf",
+        "source":    "windows_server_2025",
+        "os_family": "windows",
+        "os_name":   "Windows Server 2025",
+        "benchmark": "CIS Microsoft Windows Server 2025 Benchmark",
+        "version":   "v2.0.0",
+        "opt_in":    True,
+    },
     {
         "filename":  "CIS_Microsoft_Windows_Server_2022_Benchmark_v4.0.0.pdf",
         "source":    "windows_server_2022",
@@ -914,15 +929,26 @@ def parse_args():
                         help="Skip embedding generation (quick coverage check). "
                              "No NDJSON is written unless --output is given.")
     parser.add_argument("--only", nargs="+", metavar="SOURCE",
-                        help="Only process these sources, e.g. --only rhel_9")
+                        choices=[e["source"] for e in PDF_FILES],
+                        help="Only process these sources, e.g. --only windows_server_2025. "
+                             "Writes output.<source>.ndjson and coverage_report.<source>.json. "
+                             "Choices: %(choices)s")
     parser.add_argument("--pdf-dir", type=Path, default=PDF_DIR,
                         help="Folder containing the CIS PDFs (default: %(default)s)")
     parser.add_argument("--output", type=Path, default=None,
                         help="Output NDJSON file (default: {}; with --only: "
                              "output.<source>.ndjson)".format(OUTPUT_NDJSON))
-    parser.add_argument("--coverage-report", type=Path, default=COVERAGE_REPORT,
-                        help="Coverage report JSON (default: %(default)s)")
+    parser.add_argument("--coverage-report", type=Path, default=None,
+                        help="Coverage report JSON (default: {}; with --only: "
+                             "coverage_report.<source>.json)".format(COVERAGE_REPORT))
     args = parser.parse_args()
+
+    # A partial run gets its own coverage report, so the full run's is kept
+    if args.coverage_report is None:
+        if args.only:
+            args.coverage_report = SCRIPT_DIR / "coverage_report.{}.json".format("_".join(args.only))
+        else:
+            args.coverage_report = COVERAGE_REPORT
 
     # Never overwrite the full, embedded dataset with a partial run
     if args.output is None and not args.no_embed:
@@ -1124,7 +1150,11 @@ def main():
         print("         Run: pip install pypdf")
     print("=" * 60)
 
-    pdf_files = [e for e in PDF_FILES if not args.only or e["source"] in args.only]
+    if args.only:
+        pdf_files = [e for e in PDF_FILES if e["source"] in args.only]
+    else:
+        # Default run: every benchmark except opt-in ones (e.g. Windows Server 2025)
+        pdf_files = [e for e in PDF_FILES if not e.get("opt_in")]
 
     all_rules = []
     coverage_reports = []

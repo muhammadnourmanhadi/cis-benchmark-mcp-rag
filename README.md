@@ -62,7 +62,7 @@ A self-hosted **Hybrid RAG (Retrieval-Augmented Generation)** pipeline that pars
 └── README.md
 ```
 
-Generated files (gitignored): `1_parser_and_ingest/output.ndjson`, `1_parser_and_ingest/coverage_report.json`.
+Generated files (gitignored): `1_parser_and_ingest/output.ndjson`, `1_parser_and_ingest/coverage_report.json`, and for `--only` runs `output.<source>.ndjson` / `coverage_report.<source>.json`.
 
 ## ⚙️ Prerequisites & Dependencies
 
@@ -77,12 +77,15 @@ The parser is pre-configured for the following official CIS Benchmark PDFs. File
 
 | Source ID | File name |
 |---|---|
+| `windows_server_2025` *(opt-in)* | `CIS_Microsoft_Windows_Server_2025_Benchmark_v2.0.0.pdf` |
 | `windows_server_2022` | `CIS_Microsoft_Windows_Server_2022_Benchmark_v4.0.0.pdf` |
 | `windows_server_2019` | `CIS_Microsoft_Windows_Server_2019_Benchmark_v4.0.0.pdf` |
 | `windows_server_2016` | `CIS_Microsoft_Windows_Server_2016_Benchmark_v3.0.0.pdf` |
 | `rhel_9` | `CIS_Red_Hat_Enterprise_Linux_9_Benchmark_v2.0.0.pdf` |
 | `rhel_8` | `CIS_Red_Hat_Enterprise_Linux_8_Benchmark_v4.0.0.pdf` |
 | `rhel_7` | `CIS_Red_Hat_Enterprise_Linux_7_Benchmark_v4.0.0.pdf` |
+
+`windows_server_2025` is **opt-in**: a default run skips it, even when its PDF is in the folder, so `output.ndjson` keeps the same benchmarks as before. Process it on its own with `--only windows_server_2025` (see [Running a single benchmark](#running-a-single-benchmark-eg-windows-server-2025)).
 
 > [!TIP]
 > To import other versions (e.g. RHEL 9 v2.1.0), update the entries in the `PDF_FILES` list at the top of [ingest_cis.py](1_parser_and_ingest/ingest_cis.py) to match your file names. Run with `--no-embed --strict` first to confirm the coverage report shows no missing rules.
@@ -140,8 +143,28 @@ python 1_parser_and_ingest/ingest_cis.py
 |---|---|
 | `--strict` | Exit with code 1 if any official recommendation has no body |
 | `--no-embed` | Skip embeddings (quick coverage check). No NDJSON is written unless `--output` is given |
-| `--only rhel_9 [...]` | Process only these sources. Writes `output.rhel_9.ndjson`, so `output.ndjson` is never overwritten by a partial run |
+| `--only rhel_9 [...]` | Process only these sources (including opt-in ones). Writes `output.<source>.ndjson` and `coverage_report.<source>.json`, so the full run's files are never overwritten by a partial run |
 | `--pdf-dir`, `--output`, `--coverage-report` | Override the default paths |
+
+#### Running a single benchmark (e.g. Windows Server 2025)
+```bash
+# 1. Coverage check only (no embeddings, no NDJSON)
+python 1_parser_and_ingest/ingest_cis.py --only windows_server_2025 --no-embed --strict
+
+# 2. Full run -> separate files; output.ndjson and coverage_report.json are untouched
+python 1_parser_and_ingest/ingest_cis.py --only windows_server_2025
+#    1_parser_and_ingest/output.windows_server_2025.ndjson
+#    1_parser_and_ingest/coverage_report.windows_server_2025.json
+```
+To index it, copy that file to the Logstash input path (Step 5) **without deleting the index**. Logstash only adds or updates documents, so rules from the other benchmarks stay in `cis_benchmark`:
+```bash
+sudo cp 1_parser_and_ingest/output.windows_server_2025.ndjson /etc/logstash/conf.d/output.ndjson
+sudo systemctl restart logstash
+python 1_parser_and_ingest/verify_es_coverage.py \
+    --ndjson 1_parser_and_ingest/output.windows_server_2025.ndjson \
+    --coverage-report 1_parser_and_ingest/coverage_report.windows_server_2025.json
+```
+`verify_es_coverage.py` then reports the other benchmarks in the index as sources not covered by that NDJSON. That is expected and does not fail the run. Search it from the MCP server with `os_filter="windows_server_2025"`.
 
 The pipeline runs these stages for each PDF:
 1. **PDF text extraction**: `pdfplumber` text per page, with duplicated bold glyphs removed, page footers dropped and Table of Contents pages detected.
