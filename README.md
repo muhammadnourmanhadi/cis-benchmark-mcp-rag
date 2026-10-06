@@ -1,26 +1,30 @@
 # CIS Benchmark Hybrid RAG & MCP Server
 
-A production-ready **Hybrid RAG (Retrieval-Augmented Generation)** framework designed to parse, deduplicate, generate embeddings, and index hardening guidelines from official **CIS (Center for Internet Security) Benchmarks** into **Elasticsearch**. 
+A self-hosted **Hybrid RAG (Retrieval-Augmented Generation)** pipeline that parses official **CIS (Center for Internet Security) Benchmark** PDFs, verifies that every recommendation was captured, embeds each rule in full, indexes it into **Elasticsearch**, and exposes it to AI agents through a **Model Context Protocol (MCP)** HTTP server.
 
-### 🧠 Hybrid RAG & Structure-Aware Chunking
+### ✨ Key Features
 
-Relying solely on vector search (*dense retrieval*) often fails on technical manuals due to lack of exact constraints, while standard keyword filters (*sparse retrieval*) lack semantic intent. This project implements a true **Hybrid RAG** by merging:
-
-1. **Document-per-Rule Structure-Aware Chunking**: The custom parser [ingest_cis.py](1_parser_and_ingest/ingest_cis.py) extracts each CIS rule as a **single, undivided JSON document** in `output.ndjson`, preserving the complete context of the title, audit checks, and remediation.
-2. **Dense Retrieval (Semantic Search)**: Rules are embedded as 384-dimensional vectors (`sentence-transformers`), resolving natural language synonyms (e.g., matching "password age" to "expiration policies"). Each rule is split into passages that fit the model's 256-token window and every passage gets its own vector, so the **whole** rule (description, audit, remediation) is searchable — not just its first ~1,000 characters.
-3. **Structured Boolean Filtering**: Queries are hard-filtered in Elasticsearch using metadata criteria (Target OS, CIS Level, Profile, Automation).
-
-This **Hybrid Integration** ensures that querying *"password policy"* restricted to **RHEL 9, Level 1** dynamically intersects vector similarity with exact constraints. It prevents LLMs from hallucinating and serving Windows GPO guidelines to a Linux host, guaranteeing 100% accurate, undivided, and version-specific context in a single query. 
+- **No rule left behind**: the parser builds the official list of recommendations from the PDF itself (bookmarks + Table of Contents), checks its output against that list, recovers anything the state machine missed, and writes a coverage report. `--strict` fails the run if any official rule has no body.
+- **One document per rule**: every CIS recommendation is a single, undivided JSON document (title, profile, description, audit, remediation, references), so the LLM always receives complete, version-specific context.
+- **Whole-rule embeddings**: `all-MiniLM-L6-v2` reads only 256 tokens, while a CIS rule averages ~3,600 characters. Each rule is split into passages that fit the window and every passage gets its own vector, so audit commands and remediation steps are searchable, not just the first ~1,000 characters.
+- **Hybrid retrieval**: nested k-NN over passage vectors combined with hard metadata filters (OS, CIS level, profile, automation status), so a question about *"password policy"* on **RHEL 9, Level 1** never returns Windows GPO guidance.
+- **End-to-end verification**: `verify_es_coverage.py` confirms every parsed rule reached the index with passage vectors, and works with self-signed Elasticsearch clusters.
 
 ### 📐 System Architecture
 
 ![System Architecture Topology](hybrid_rag_flow_diagram.png)
 
-1. **Parser & Embeddings**: The script [ingest_cis.py](1_parser_and_ingest/ingest_cis.py) parses official raw CIS PDFs line-by-line using a **3-state state-machine** (`SCANNING → BUFFERING → ACCUMULATING`) that performs **Document-per-Rule Structure-Aware Chunking**. It detects rule headers via dual-format regex (Windows: `1.2.1 (L1) Ensure ...` / Linux: `1.1.1.7 Ensure ...`), accumulates all subsequent content lines (Description, Audit, Remediation, Default Value) until the next header, then runs regex-based post-processing to extract structured `sections` and `metadata` fields. Finally, it batch-encodes each rule's full text into a **384-dimensional dense vector** using `all-MiniLM-L6-v2` and writes the result as one JSON-per-line to `output.ndjson`.
+1. **Parser & Embeddings** — [ingest_cis.py](1_parser_and_ingest/ingest_cis.py)
+   - Extracts text per page with `pdfplumber` and reads the official rule list from the PDF bookmarks (`pypdf`) and Table of Contents.
+   - A line-by-line state machine (`SCANNING → BUFFERING → ACCUMULATING`) detects rule headers with one generic regex (any title wording; Windows `(L1)/(L2)/(NG)/(BL)` tags) and accumulates each rule's content. Only official rule IDs can open a header, so section titles and CIS Controls table rows cannot hijack the next rule.
+   - Post-processing extracts `sections` (audit, remediation) and `metadata` (profile applicability, CIS level).
+   - Each rule is split into token-bounded passages and embedded into **384-dimensional** vectors, then written as one JSON document per line to `output.ndjson`.
 
-2. **Logstash Ingestion Pipeline**: Logstash reads `output.ndjson` line-by-line using the `json` codec, strips injected Logstash metadata (`@timestamp`, `@version`, `host`), and bulk-indexes documents into Elasticsearch under the `cis_benchmark` index. Each document receives a composite `document_id` of `%{rule_id}-%{[metadata][source]}` to guarantee cross-OS deduplication (e.g., rule `1.1.1` from `windows_server_2022` and `rhel_9` are stored as distinct documents).
+2. **Logstash Ingestion Pipeline** — [cis_benchmark.conf](2_elasticsearch_config/cis_benchmark.conf)
+   Reads `output.ndjson` line by line, strips Logstash metadata and bulk-indexes into the `cis_benchmark` index with `document_id = %{rule_id}-%{[metadata][source]}`, so the same rule ID from different benchmarks (e.g. `windows_server_2022` and `rhel_9`) stays distinct.
 
-3. **HTTP MCP Server**: The FastMCP server [cis_mcp_server_http.py](3_mcp_server/cis_mcp_server_http.py) runs inside a Docker container using `streamable-http` transport on port `8765`. It lazy-loads the same `all-MiniLM-L6-v2` embedding model at startup to vectorize incoming queries, then constructs Elasticsearch k-NN payloads with optional boolean `filter` clauses. It connects to the host-native Elasticsearch via Localhost and exposes 6 specialized MCP tools to AI agent clients.
+3. **HTTP MCP Server** — [cis_mcp_server_http.py](3_mcp_server/cis_mcp_server_http.py)
+   A FastMCP server (MCP Python SDK 1.x) in Docker, `streamable-http` transport on port `8765`. It embeds incoming queries with the same `all-MiniLM-L6-v2` model (baked into the image, CPU-only PyTorch), runs nested k-NN on `passages.vector` with optional metadata filters, and exposes 6 MCP tools to AI agent clients.
 
 ---
 
@@ -35,50 +39,53 @@ This **Hybrid Integration** ensures that querying *"password policy"* restricted
 ## 📁 Repository Structure
 
 ```text
-├── 1_parser_and_ingest/       # PDF Extraction & Ingestion Pipeline
-│   ├── cis_benchmarks/        # Place your downloaded official CIS PDFs here (gitignored)
-│   ├── ingest_cis.py          # State-machine parser and vector embedding generator
-│   ├── verify_es_coverage.py  # Checks every parsed rule reached Elasticsearch
-│   └── requirements_ingest.txt # Ingestion dependencies (install CPU torch first)
+├── 1_parser_and_ingest/             # PDF Extraction & Ingestion Pipeline
+│   ├── cis_benchmarks/              # Place your downloaded official CIS PDFs here (gitignored)
+│   ├── ingest_cis.py                # Ground-truth driven parser, coverage report, passage embeddings
+│   ├── verify_es_coverage.py        # Checks every parsed rule reached Elasticsearch with passage vectors
+│   ├── pick_retrieval_tests.py      # Builds deep-text test questions to validate retrieval
+│   └── requirements_ingest.txt      # Ingestion dependencies (install CPU-only torch first)
 │
-├── 2_elasticsearch_config/    # Database Schema Mapping & Logstash Pipelines
-│   ├── index_template.json    # ES mapping template with dense_vector schema configurations
-│   └── cis_benchmark.conf     # Logstash integration configuration
+├── 2_elasticsearch_config/          # Database Schema Mapping & Logstash Pipelines
+│   ├── index_template.json          # Mapping: keyword metadata, nested passages.vector, text_embedding
+│   └── cis_benchmark.conf           # Logstash pipeline (NDJSON -> cis_benchmark index)
 │
-├── 3_mcp_server/              # Model Context Protocol API Server
-│   ├── Dockerfile.mcp         # Docker container packaging script
-│   ├── docker-compose.yml     # Docker compose deployment configurations
-│   ├── .env.example           # Environment variables configuration template
-│   ├── requirements_mcp.txt   # Python dependencies required by the server
-│   ├── cis_mcp_server_http.py # Main FastMCP server (HTTP Transport mode)
-│   └── SKILL.md               # AI Agent cognitive search routing guidelines
+├── 3_mcp_server/                    # Model Context Protocol API Server
+│   ├── Dockerfile.mcp               # Image with CPU-only PyTorch and the embedding model pre-downloaded
+│   ├── docker-compose.yml           # Compose deployment (host network, reads 3_mcp_server/.env)
+│   ├── .env.example                 # Template for .env (ES_* settings, also read by verify_es_coverage.py)
+│   ├── requirements_mcp.txt         # Server dependencies (mcp<2, sentence-transformers, elasticsearch)
+│   ├── cis_mcp_server_http.py       # FastMCP server (streamable-http transport)
+│   └── SKILL.md                     # AI agent search routing guidelines
 │
-├── .gitignore                 # Configured security exclusions for git commits
-└── README.md                  # Project documentation (This file)
+├── .gitignore
+└── README.md
 ```
+
+Generated files (gitignored): `1_parser_and_ingest/output.ndjson`, `1_parser_and_ingest/coverage_report.json`.
 
 ## ⚙️ Prerequisites & Dependencies
 
-To set up and run this project, your environment must satisfy the following:
-
-1. **Python Runtime**: Python 3.10+ (Python 3.11/3.12 recommended).
-2. **PyTorch & Transformers Setup**: System memory of at least 8GB RAM is recommended to run local embedding models (`all-MiniLM-L6-v2`).
-3. **Database**: Elasticsearch **8.11 or newer** with k-NN/vector search enabled. The index template maps an indexed `dense_vector` inside the nested `passages` field, which older versions reject. (The MCP server still falls back to the single `text_embedding` vector for an index created before `passages` existed.)
-4. **Logstash Ingestion Pipeline**: Logstash instance configured with [cis_benchmark.conf](2_elasticsearch_config/cis_benchmark.conf) to stream NDJSON records into Elasticsearch.
-5. **Docker**: Docker Engine & Docker Compose installed for running the MCP server container.
+1. **Python**: 3.10+ (3.11/3.12 recommended). RHEL 9 ships Python 3.9 as `python3`, which is end-of-life and gets older `sentence-transformers` releases; install a newer one with `sudo dnf install python3.12`.
+2. **Memory**: at least 8 GB RAM is recommended for embedding with `all-MiniLM-L6-v2` on CPU.
+3. **Elasticsearch 8.11 or newer**: the index template maps an indexed `dense_vector` inside the nested `passages` field, which older versions reject.
+4. **Logstash**: configured with [cis_benchmark.conf](2_elasticsearch_config/cis_benchmark.conf).
+5. **Docker**: Docker Engine and Docker Compose for the MCP server.
 
 ### 🎯 Supported Benchmarks (Scope of Ingestion)
-The state-machine parser ([ingest_cis.py](1_parser_and_ingest/ingest_cis.py)) is pre-configured and optimized to process the following official CIS Benchmark PDF variants. The file names inside `1_parser_and_ingest/cis_benchmarks/` must match these patterns:
+The parser is pre-configured for the following official CIS Benchmark PDFs. File names inside `1_parser_and_ingest/cis_benchmarks/` must match:
 
-* **Windows Server 2022**: `CIS_Microsoft_Windows_Server_2022_Benchmark_v4.0.0.pdf`
-* **Windows Server 2019**: `CIS_Microsoft_Windows_Server_2019_Benchmark_v4.0.0.pdf`
-* **Windows Server 2016**: `CIS_Microsoft_Windows_Server_2016_Benchmark_v3.0.0.pdf`
-* **Red Hat Enterprise Linux 9**: `CIS_Red_Hat_Enterprise_Linux_9_Benchmark_v2.0.0.pdf`
-* **Red Hat Enterprise Linux 8**: `CIS_Red_Hat_Enterprise_Linux_8_Benchmark_v4.0.0.pdf`
-* **Red Hat Enterprise Linux 7**: `CIS_Red_Hat_Enterprise_Linux_7_Benchmark_v4.0.0.pdf`
+| Source ID | File name |
+|---|---|
+| `windows_server_2022` | `CIS_Microsoft_Windows_Server_2022_Benchmark_v4.0.0.pdf` |
+| `windows_server_2019` | `CIS_Microsoft_Windows_Server_2019_Benchmark_v4.0.0.pdf` |
+| `windows_server_2016` | `CIS_Microsoft_Windows_Server_2016_Benchmark_v3.0.0.pdf` |
+| `rhel_9` | `CIS_Red_Hat_Enterprise_Linux_9_Benchmark_v2.0.0.pdf` |
+| `rhel_8` | `CIS_Red_Hat_Enterprise_Linux_8_Benchmark_v4.0.0.pdf` |
+| `rhel_7` | `CIS_Red_Hat_Enterprise_Linux_7_Benchmark_v4.0.0.pdf` |
 
 > [!TIP]
-> If you wish to import different versions (e.g. Windows Server 2022 v4.1.0 or RHEL 9 v2.1.0), simply update the metadata descriptors inside the `PDF_FILES` list located at the top of the [ingest_cis.py](1_parser_and_ingest/ingest_cis.py) script to match your local file names.
+> To import other versions (e.g. RHEL 9 v2.1.0), update the entries in the `PDF_FILES` list at the top of [ingest_cis.py](1_parser_and_ingest/ingest_cis.py) to match your file names. Run with `--no-embed --strict` first to confirm the coverage report shows no missing rules.
 
 ---
 
@@ -86,160 +93,211 @@ The state-machine parser ([ingest_cis.py](1_parser_and_ingest/ingest_cis.py)) is
 
 ```mermaid
 graph TD
-    A[1. Clone Repo & Create Venv] --> B[2. Download PDFs from CIS Workbench]
-    B --> C[3. Run ingest_cis.py → output.ndjson]
-    C --> D[4. Register ES Index Template]
-    D --> E[5. Deploy cis_benchmark.conf & output.ndjson to Logstash]
-    E --> F[6. Build & Start MCP Server via Docker Compose]
+    A[1. Clone repo & create venv] --> B[2. Download PDFs from CIS Workbench]
+    B --> C[3. Run ingest_cis.py → output.ndjson + coverage_report.json]
+    C --> D[4. Register ES index template]
+    D --> E[5. Stream output.ndjson via Logstash]
+    E --> F[6. Verify with verify_es_coverage.py]
+    F --> G[7. Build & start MCP server]
+    G --> H[8. Test retrieval with an AI agent]
 ```
 
-### Step 1: Clone the Repo & Setup Venv
+### Step 1: Clone the Repo & Set Up a Virtual Environment
 ```bash
 git clone https://github.com/your-username/cis-benchmark-mcp-rag.git
 cd cis-benchmark-mcp-rag
 
-# Setup Python Virtual Environment
-python -m venv venv
-# Activate on Windows:
-.\venv\Scripts\activate
-# Activate on macOS/Linux:
-source venv/bin/activate
+python3.12 -m venv venv
+source venv/bin/activate            # Windows: .\venv\Scripts\activate
 
-# Install ingestion dependencies
-# CPU-only PyTorch first (the default Linux wheel is the CUDA build, ~1.5 GB with nvidia-* packages).
-# Skip this line if you have an NVIDIA GPU and want to embed on it.
+# CPU-only PyTorch first: the default Linux wheel is the CUDA build
+# (~555 MB plus >1 GB of nvidia-* packages). Skip this line only if you
+# want to embed on an NVIDIA GPU.
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install -r 1_parser_and_ingest/requirements_ingest.txt
-
-# Only checking parsing/coverage (--no-embed)? This is all you need (~75 MB, no torch):
-# pip install pdfplumber pypdf
 ```
 
-### Step 2: Download CIS Benchmarks PDF
-1. Go to the [CIS Workbench Portal](https://workbench.cisecurity.org/) and download your required benchmark files. Supported targets include:
-   * Windows Server 2016 / 2019 / 2022
-   * Red Hat Enterprise Linux 7 / 8 / 9
-2. Place the downloaded `.pdf` files inside `1_parser_and_ingest/cis_benchmarks/`.
+| Task | Packages needed |
+|---|---|
+| Parsing, chunking and coverage check (`--no-embed`) | `pdfplumber`, `pypdf` only (~75 MB, no torch) |
+| Full run with embeddings | + `sentence-transformers` + CPU-only `torch` |
+| `verify_es_coverage.py` | + `elasticsearch` |
 
-### Step 3: Run Ingestion (Local Parsing & Embeddings)
-Execute the ingestion script. It will parse the PDF text structure using a line-by-line state machine, generate 384-dimensional vector embeddings, and save the output:
+### Step 2: Download the CIS Benchmark PDFs
+1. Download the benchmarks you need from the [CIS Workbench Portal](https://workbench.cisecurity.org/).
+2. Place the `.pdf` files inside `1_parser_and_ingest/cis_benchmarks/`.
+
+### Step 3: Run Ingestion (Parsing, Coverage Check & Embeddings)
 ```bash
-python 1_parser_and_ingest/ingest_cis.py
+# Recommended first: quick coverage check, no embeddings, writes no NDJSON
+python 1_parser_and_ingest/ingest_cis.py --no-embed --strict
 
-# Useful options
-python 1_parser_and_ingest/ingest_cis.py --strict           # exit 1 if any official rule has no body
-python 1_parser_and_ingest/ingest_cis.py --no-embed --only rhel_9   # quick coverage check (writes no NDJSON)
-python 1_parser_and_ingest/ingest_cis.py --only rhel_9   # writes output.rhel_9.ndjson, output.ndjson untouched
+# Full run: parse, verify coverage, embed, write output.ndjson
+python 1_parser_and_ingest/ingest_cis.py
 ```
 
-The script performs the following pipeline in sequence:
-1. **PDF Text Extraction**: Opens each PDF with `pdfplumber`, extracts text per page (de-duplicating bold glyphs), drops page footers and detects Table of Contents pages.
-2. **Ground Truth**: Builds the official list of recommendations from the PDF bookmarks (`pypdf`) and the Table of Contents. Every rule in this list must end up in the output.
-3. **State-Machine Parsing**: Scans each line with one generic header regex (any title wording; Windows `(L1)/(L2)/(NG)/(BL)` tags). Only official rule IDs can open a multi-line header, so section titles (`1.1.1 Configure ...`) and CIS Controls table rows (`9.2 Ensure Only Approved Ports ...`) can no longer swallow the next rule. Parsing stops at the Appendix. Detected rules transition through `SCANNING → BUFFERING → ACCUMULATING` states.
-4. **Candidate Selection & Recovery**: Keeps the most complete candidate per rule (with Profile Applicability / Description / Audit / Remediation), drops IDs that are not official recommendations, and rebuilds any official rule the state machine missed by locating its ID in the body pages (`metadata.parse_method = "recovered"`).
-5. **Coverage Report**: Prints expected vs parsed counts per PDF and lists recovered, dropped and missing rules. Saved to `1_parser_and_ingest/coverage_report.json`.
-6. **Post-Processing**: Extracts structured fields from raw content using regex: `sections.audit_text`, `sections.remediation_text`, `metadata.profile_applicability`, and backfills `metadata.cis_level` for RHEL rules from Profile Applicability text.
-7. **Passage Embedding**: `all-MiniLM-L6-v2` only reads 256 tokens, while a CIS rule averages ~3,600 characters. Each rule is split into passages that fit the window (each starts with `rule_id + title`, with ~32 tokens of overlap), and every passage is embedded in batches (default: 64). Each document gets:
-   * `passages[]` — `{chunk_id, vector}` per passage, searched with nested kNN by the MCP server (each rule is returned once, scored by its best passage).
-   * `text_embedding` — normalized mean of the passage vectors, a single-vector fallback that covers the whole rule.
-8. **Quality Report**: Prints per-OS rule counts, CIS Level distribution, automation status breakdown, section extraction coverage percentages, and content length statistics.
+| Option | Effect |
+|---|---|
+| `--strict` | Exit with code 1 if any official recommendation has no body |
+| `--no-embed` | Skip embeddings (quick coverage check). No NDJSON is written unless `--output` is given |
+| `--only rhel_9 [...]` | Process only these sources. Writes `output.rhel_9.ndjson`, so `output.ndjson` is never overwritten by a partial run |
+| `--pdf-dir`, `--output`, `--coverage-report` | Override the default paths |
 
-This generates:
-* `1_parser_and_ingest/output.ndjson` (Logstash-compatible **Newline Delimited JSON** format, where each line represents exactly one self-contained document).
-* `1_parser_and_ingest/coverage_report.json` (expected vs parsed rules per benchmark). `MISSING` must be `0` for every PDF.
+The pipeline runs these stages for each PDF:
+1. **PDF text extraction**: `pdfplumber` text per page, with duplicated bold glyphs removed, page footers dropped and Table of Contents pages detected.
+2. **Ground truth**: the official list of recommendations from the PDF bookmarks (`pypdf`) and the Table of Contents.
+3. **State-machine parsing**: generic header detection, gated by official rule IDs. It stops at the Appendix, so summary tables don't repeat rules.
+4. **Candidate selection & recovery**:
+   - The most complete candidate per rule is kept.
+   - IDs that are not official recommendations and have no body are dropped.
+   - Any official rule the state machine missed is rebuilt from the body pages (`metadata.parse_method = "recovered"`).
+   - Content that ran into the next rule is trimmed.
+5. **Coverage report**: expected vs parsed counts, recovered, dropped and missing rules. It is printed and saved to `coverage_report.json`. **`MISSING` must be `0`.**
+6. **Post-processing**: extracts `sections.audit_text` and `sections.remediation_text`, then `metadata.profile_applicability`. It backfills `metadata.cis_level` from Profile Applicability (RHEL headers carry no level).
+7. **Passage embedding**: each rule is split into passages that fit the model's 256-token window:
+   - Every passage starts with `rule_id (level) title (status)`.
+   - Lines are packed one at a time, and over-long lines are cut at word boundaries.
+   - Up to ~32 tokens of overlap are carried over from the previous passage.
+   - Every passage is embedded in batches of 64.
+8. **Quality report**: per-OS counts, CIS level and automation breakdown, section extraction coverage and passage counts.
 
-### Step 4: Register Index Template in Elasticsearch
+Example: the RHEL 9 v2.0.0 benchmark parses to 297 of 297 recommendations, with 100% audit/remediation/profile extraction and 0 missing.
+
+**Document shape** (one line of `output.ndjson`):
+```jsonc
+{
+  "rule_id": "1.1.1.1",
+  "rule_title": "Ensure cramfs kernel module is not available",
+  "content_for_vector": "1.1.1.1 Ensure cramfs ... (Automated)\nProfile Applicability:\n...",  // full rule text
+  "sections": { "audit_text": "...", "remediation_text": "..." },
+  "passages": [ { "chunk_id": 0, "vector": [/* 384 floats */] }, ... ],  // searched by the MCP server
+  "text_embedding": [/* 384 floats: normalized mean of the passage vectors */],
+  "metadata": {
+    "cis_level": "L1", "automation_status": "Automated",
+    "profile_applicability": ["level_1_server", "level_1_workstation"],
+    "source": "rhel_9", "os_family": "linux", "os_name": "Red Hat Enterprise Linux 9",
+    "benchmark": "CIS Red Hat Enterprise Linux 9 Benchmark", "version": "v2.0.0",
+    "source_pages": [20, 21, 22], "parse_method": "state_machine"   // or "recovered" / "title_only"
+  }
+}
+```
+
+### Step 4: Register the Index Template in Elasticsearch
 
 > [!IMPORTANT]
-> **Register the index template BEFORE streaming data via Logstash.** This ensures Elasticsearch maps `text_embedding` and the nested `passages.vector` fields as `dense_vector` types rather than dynamically indexing them as auto-detected float lists.
+> Register the template **before** streaming data, so `passages` is mapped as `nested` with an indexed `dense_vector`. A template only applies to **newly created** indices. If `cis_benchmark` already exists from an earlier run, delete it first. Otherwise `passages` stays a plain object and the MCP server can only search the single `text_embedding` vector.
 
-> [!WARNING]
-> An index template only applies to **newly created** indices. If `cis_benchmark` already exists (for example from a run before the nested `passages` field was added), delete it first — otherwise `passages` is mapped as a plain object and the MCP server can only search the single `text_embedding` vector.
-> ```bash
-> curl -X DELETE "https://YOUR_ES_HOST:9200/cis_benchmark"
-> ```
-
-Apply the custom index template to your Elasticsearch instance:
 ```bash
-curl -X PUT "http://YOUR_ES_HOST:9200/_index_template/cis_benchmark_template" \
+CA=/etc/elasticsearch/certs/http_ca.crt      # or a readable copy of it
+
+# Only when re-ingesting: remove the old index (also removes rules stored under outdated IDs)
+curl --cacert $CA -u elastic -X DELETE "https://127.0.0.1:9200/cis_benchmark"
+
+curl --cacert $CA -u elastic -X PUT "https://127.0.0.1:9200/_index_template/cis_benchmark_template" \
      -H "Content-Type: application/json" \
      -d @2_elasticsearch_config/index_template.json
 ```
 
-### Step 5: Stream Dataset via Logstash
-
-With the index template registered, stream the dataset into Elasticsearch:
-
-1. **Deploy Configuration File**: Copy [cis_benchmark.conf](2_elasticsearch_config/cis_benchmark.conf) to your Logstash configuration directory (usually `/etc/logstash/conf.d/` on Linux):
-   ```bash
-   cp 2_elasticsearch_config/cis_benchmark.conf /etc/logstash/conf.d/
-   ```
-2. **Deploy Dataset File**: Copy the generated `output.ndjson` dataset to the Logstash directory:
-   ```bash
-   cp 1_parser_and_ingest/output.ndjson /etc/logstash/conf.d/
-   ```
-   *Note: The pipeline configuration expects the dataset to be placed at `/etc/logstash/conf.d/output.ndjson` to trigger the ingestion pipeline.*
-
-3. **Start/Restart Logstash**: Restart the Logstash service to run the pipeline:
-   ```bash
-   sudo systemctl restart logstash
-   ```
-
-The Logstash pipeline ([cis_benchmark.conf](2_elasticsearch_config/cis_benchmark.conf)) performs:
-* **Input**: Reads `output.ndjson` line-by-line from the beginning using `json` codec with `sincedb_path => "/dev/null"` (forces full re-read on each restart).
-* **Filter**: Strips Logstash-injected fields (`@timestamp`, `@version`, `host`, `log`, `event`) via `mutate.remove_field` to keep documents clean for RAG retrieval.
-* **Output**: Bulk-indexes into Elasticsearch under the `cis_benchmark` index with a composite `document_id` of `%{rule_id}-%{[metadata][source]}` to prevent cross-OS duplicates.
-
-> [!IMPORTANT]
-> **Re-ingesting after a parser change:** documents from an older run (e.g. rules stored under a wrong `rule_id`) are not overwritten because their `document_id` differs. Delete the index first, then re-register the template and restart Logstash:
-> ```bash
-> curl -X DELETE "https://YOUR_ES_HOST:9200/cis_benchmark"
-> curl -X PUT "https://YOUR_ES_HOST:9200/_index_template/cis_benchmark_template" \
->      -H "Content-Type: application/json" -d @2_elasticsearch_config/index_template.json
-> sudo systemctl restart logstash
-> ```
-
-**Verify every rule reached the index** (uses the same `ES_*` variables as the MCP server):
+### Step 5: Stream the Dataset via Logstash
 ```bash
-pip install "elasticsearch>=8.0.0,<10.0.0"
-ES_HOST=https://127.0.0.1:9200 ES_USER=elastic ES_PASSWORD=... ES_FINGERPRINT=... \
-  python 1_parser_and_ingest/verify_es_coverage.py
+sudo cp 2_elasticsearch_config/cis_benchmark.conf /etc/logstash/conf.d/
+sudo cp 1_parser_and_ingest/output.ndjson /etc/logstash/conf.d/
+sudo systemctl restart logstash
 ```
-Settings that are not exported in the shell are read from `3_mcp_server/.env`, so the MCP server's configuration works as is (use `--env-file` for another file). For a self-signed cluster set `ES_FINGERPRINT` to the HTTP CA fingerprint (`openssl x509 -fingerprint -sha256 -noout -in /etc/elasticsearch/certs/http_ca.crt`) or `ES_CA_CERT` to the CA file.
+Before copying, edit `hosts`, `user`, `password` and `ca_trusted_fingerprint` in `cis_benchmark.conf`. The pipeline expects the dataset at `/etc/logstash/conf.d/output.ndjson`.
 
-It lists rules in `output.ndjson` that are missing from the index and stale documents in the index that are not in `output.ndjson`.
+The pipeline:
+* **Input**: reads `output.ndjson` from the beginning with the `json` codec. `sincedb_path => "/dev/null"` forces a full re-read on every restart.
+* **Filter**: removes Logstash fields (`@timestamp`, `@version`, `host`, `log`, `event`).
+* **Output**: bulk-indexes into `cis_benchmark` with `document_id = %{rule_id}-%{[metadata][source]}`.
 
-### Step 6: Configure and Deploy the MCP Server
-1. Navigate to the MCP folder and clone the environment template:
+### Step 6: Verify Every Rule Reached the Index
+```bash
+python 1_parser_and_ingest/verify_es_coverage.py
+```
+Elasticsearch settings come from the shell (`ES_HOST`, `ES_USER`, `ES_PASSWORD`, `ES_FINGERPRINT`, `ES_CA_CERT`, `ES_INDEX`). Anything not exported is read from `3_mcp_server/.env`, so the MCP server configuration works as is. Use `--env-file` to point at another file.
+
+For each source, the script reports:
+* the official recommendations from `coverage_report.json`
+* the rules in `output.ndjson`
+* the rules found in the index, and the ones **missing** from it
+* **stale** documents in the index that are not in `output.ndjson`
+* documents **without passage vectors**
+
+It exits with code 1 in any of these cases:
+* a rule is missing from the index
+* the index has no nested `passages` mapping
+* a document lacks passage vectors
+* the index or the cluster cannot be reached
+
+**TLS with self-signed clusters.** The script prints the mode it uses (`TLS verify : ...`):
+
+| Setting | Behaviour |
+|---|---|
+| `ES_CA_CERT=/path/http_ca.crt` | Full verification against the CA file. Takes precedence over `ES_FINGERPRINT`. |
+| `ES_FINGERPRINT=<HTTP CA SHA-256>` | The script reads the certificates the server actually sends. A CA match verifies the chain against that CA. A match on the server certificate pins it. This also works on Python 3.9, where the chain is read with `openssl s_client`. |
+| neither | System CA store (fails on a self-signed cluster) |
+
+Get the CA fingerprint with `sudo openssl x509 -fingerprint -sha256 -noout -in /etc/elasticsearch/certs/http_ca.crt`.
+
+### Step 7: Configure and Deploy the MCP Server
+1. Create the environment file:
    ```bash
    cp 3_mcp_server/.env.example 3_mcp_server/.env
    ```
-2. Edit `3_mcp_server/.env` to configure your connection credentials for the Elasticsearch instance:
+2. Edit `3_mcp_server/.env`:
    ```ini
-   ES_HOST=https://127.0.0.1:9200
-   ES_USER=elastic
-   ES_PASSWORD=your_strong_password_here
-   ES_INDEX=cis_benchmark
-   ES_FINGERPRINT=your_elasticsearch_ssl_fingerprint
+   ES_HOST="https://127.0.0.1:9200"
+   ES_USER="elastic"
+   ES_PASSWORD="your_strong_password_here"
+   ES_INDEX="cis_benchmark"
+   ES_FINGERPRINT="your_http_ca_sha256_fingerprint"
    ```
-3. Build and launch the container from the project root using Docker Compose:
+3. Build and start the container. Use `--no-cache` after dependency changes, so a cached `pip install` layer is not reused:
    ```bash
+   docker compose -f 3_mcp_server/docker-compose.yml build --no-cache
    docker compose -f 3_mcp_server/docker-compose.yml up -d
+   docker compose -f 3_mcp_server/docker-compose.yml logs -f
    ```
 
-The MCP server will be accessible at `http://localhost:8765/mcp`. Connect your AI agent client (e.g., Hermes Agent, OpenWebUI) using the MCP endpoint URL.
+The container uses the host network, so the server is available at `http://localhost:8765/mcp`. Connect your AI agent client (e.g. Hermes Agent, OpenWebUI) to that URL.
+
+After the first search, the log should show `kNN search field: passages.vector`. If it shows `text_embedding` with a warning, the index was created without the nested mapping: repeat Steps 4–5, then restart the server (`docker compose -f 3_mcp_server/docker-compose.yml restart`) so it reads the new mapping.
+
+### Step 8: Test Retrieval with an AI Agent
+The real test of whole-rule embeddings is a question whose answer appears **only deep in the audit or remediation text**, not in the title or description:
+```bash
+python 1_parser_and_ingest/pick_retrieval_tests.py --source rhel_9 --count 10
+```
+The script prints random rules, each with a command/config line taken from more than 1,200 characters into the rule. For each one, ask your MCP-connected agent:
+
+> *"In CIS RHEL 9, which rule's audit or remediation contains `<printed line>`? Give the rule ID."*
+
+The expected rule ID should rank in the top 1–3 `search_cis_benchmark` results (8 of 10 correct or better).
 
 ---
 
 ## 🧰 Registered MCP Tools Reference
 
-Once connected, the MCP Server exposes the following tools to your LLM agent:
-
 | Tool Name | Query Type | Description | Key Parameters |
 |---|---|---|---|
-| `search_cis_benchmark` | Hybrid k-NN Search | Executes hybrid semantic vector queries with optional metadata pre-filtering to retrieve precise remediation blocks. | `query`, `cis_level`, `profile`, `os_filter`, `is_automated`, `top_k` |
-| `count_cis_rules` | Aggregation / Count | Returns exact counts of rules matching filter combinations. Use for "how many" questions instead of `search_cis_benchmark`. | `cis_level`, `profile`, `os_filter`, `is_automated` |
-| `breakdown_cis_rules` | Aggregation / Breakdown | Groups rules by their primary numbered sections using Elasticsearch Painless Scripting, with human-readable category names (e.g., Section 18 → "Administrative Templates"). | `os_filter`, `cis_level`, `profile` |
-| `list_cis_rules` | Pagination List | Lists rule IDs and titles using cursor/offset pagination. Use when exporting full catalogs or browsing page-by-page. | `os_filter`, `cis_level`, `profile`, `section`, `page`, `page_size` |
-| `list_available_sources` | Utility / Catalog | Catalogs which OS platforms are indexed and their document counts. Returns `source_id` values for use in `os_filter`. | — |
-| `get_cis_statistics` | Global Audit | Returns total rule counts and CIS Level L1/L2 distribution statistics, optionally filtered by OS. | `os_filter` |
+| `search_cis_benchmark` | Hybrid k-NN Search | Nested k-NN over `passages.vector` (each rule returned once, scored by its best passage) with optional metadata pre-filters. Returns rule ID, title, applicability, audit and remediation. | `query`, `cis_level`, `profile`, `os_filter`, `is_automated`, `top_k` |
+| `count_cis_rules` | Aggregation / Count | Exact counts of rules matching filter combinations. Use for "how many" questions. | `cis_level`, `profile`, `os_filter`, `is_automated` |
+| `breakdown_cis_rules` | Aggregation / Breakdown | Groups rules by top-level section with human-readable category names (e.g. Section 18 → "Administrative Templates"). | `os_filter`, `cis_level`, `profile` |
+| `list_cis_rules` | Pagination List | Lists rule IDs and titles page by page. | `os_filter`, `cis_level`, `profile`, `section`, `page`, `page_size` |
+| `list_available_sources` | Utility / Catalog | Which OS platforms are indexed and their document counts. Returns the `source_id` values used by `os_filter`. | — |
+| `get_cis_statistics` | Global Audit | Total rule counts and L1/L2 distribution, optionally per OS. | `os_filter` |
+
+---
+
+## 🩺 Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| CIS controls missing from the index | Parser gaps, or stale documents from an older run | Run `ingest_cis.py --no-embed --strict` and check `MISSING` in the coverage report. Then delete the index, re-register the template, re-run Logstash and `verify_es_coverage.py`. |
+| `ModuleNotFoundError: No module named 'mcp.server.fastmcp'` (mcp 2.x) | Image built with mcp 2.x, where FastMCP was renamed | `requirements_mcp.txt` pins `mcp<2`. Rebuild with `docker compose ... build --no-cache`. |
+| `pip` downloads `torch-...manylinux...whl (554 MB)` and `nvidia-*` | Default CUDA build of PyTorch | Install `torch` from `https://download.pytorch.org/whl/cpu` first. The Dockerfile already does. |
+| `CERTIFICATE_VERIFY_FAILED: self-signed certificate in certificate chain` | `ES_FINGERPRINT`/`ES_CA_CERT` not reaching the script (set without `export`) | Put the values in `3_mcp_server/.env` or `export` them. The script prints the TLS mode it uses. |
+| `Fingerprints did not match`, with only the server certificate listed | Python 3.9 cannot read the TLS chain | Current `verify_es_coverage.py` reads the chain with `openssl`. Alternatively use `ES_CA_CERT`, or a Python 3.10+ venv. |
+| MCP log shows `kNN search field: text_embedding` | Index created without the nested `passages` mapping | Delete the index, re-register the template (ES 8.11+), re-run Logstash, then restart the MCP container. |
+| `Docs without passage vectors` > 0 | `output.ndjson` produced with `--no-embed`, or an old file | Re-run `ingest_cis.py` without `--no-embed` and re-ingest. |
