@@ -96,6 +96,13 @@ def ids_for_source(es, index, source):
     return ids
 
 
+def sources_in_index(es, index):
+    """Return {source: doc_count} for every source stored in the index."""
+    resp = es.search(index=index, size=0,
+                     aggs={"sources": {"terms": {"field": "metadata.source", "size": 100}}})
+    return {b["key"]: b["doc_count"] for b in resp["aggregations"]["sources"]["buckets"]}
+
+
 def main():
     parser = argparse.ArgumentParser(description="Verify CIS rules in Elasticsearch")
     parser.add_argument("--ndjson", type=Path, default=SCRIPT_DIR / "output.ndjson")
@@ -115,6 +122,11 @@ def main():
     es = get_es()
     by_source = load_ndjson(args.ndjson)
     total_gaps = 0
+
+    if not es.indices.exists(index=args.index):
+        print("ERROR: index '{}' does not exist — register the template and run Logstash.".format(
+            args.index))
+        return 1
 
     print("=" * 60)
     print("  Elasticsearch coverage check — index: {}".format(args.index))
@@ -138,6 +150,12 @@ def main():
             len(missing), missing[:20] if missing else ""))
         print("    Stale docs (not in NDJSON)     : {:>5,d} {}".format(
             len(stale), stale[:20] if stale else ""))
+
+    # Sources in the index that this NDJSON does not cover at all
+    for source, count in sorted(sources_in_index(es, args.index).items()):
+        if source not in by_source:
+            print("\n  [{}] {:,d} docs in index, source not in {} — stale or from "
+                  "another run.".format(source, count, args.ndjson.name))
 
     print("\n" + "=" * 60)
     if total_gaps:

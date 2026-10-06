@@ -228,10 +228,42 @@ def load_pages(pdf_path):
                 if line and not FOOTER_RE.match(line):
                     lines.append(line)
 
-            # Table of Contents page: several lines ending in dot leaders + page number
-            is_toc = sum(1 for l in lines if TOC_LINE_RE.search(l)) >= 3
-            pages.append({"num": page_num, "lines": lines, "is_toc": is_toc})
+            pages.append({
+                "num": page_num,
+                "lines": lines,
+                "toc_lines": sum(1 for l in lines if TOC_LINE_RE.search(l)),
+                "has_labels": any(SECTION_LABEL_RE.match(l) for l in lines),
+            })
+
+    # Table of Contents page: several lines ending in dot leaders + page number,
+    # or a short trailing ToC page right after one. Pages with recommendation
+    # section labels (Audit:, Remediation:, ...) are never ToC pages.
+    prev_toc = False
+    for page in pages:
+        is_toc = not page["has_labels"] and (
+            page["toc_lines"] >= 3 or (page["toc_lines"] >= 1 and prev_toc))
+        page["is_toc"] = prev_toc = is_toc
     return pages
+
+
+def _is_appendix_start(line):
+    """An appendix heading in the body (not a ToC entry pointing to it)."""
+    return bool(APPENDIX_RE.match(line)) and not TOC_LINE_RE.search(line)
+
+
+def body_lines(pages):
+    """Flatten non-ToC pages into (page_num, line) up to the appendix."""
+    body = []
+    seen_rule_id = False
+    for page in pages:
+        if page["is_toc"]:
+            continue
+        for line in page["lines"]:
+            if seen_rule_id and _is_appendix_start(line):
+                return body
+            seen_rule_id = seen_rule_id or bool(RULE_ID_PREFIX_RE.match(line))
+            body.append((page["num"], line))
+    return body
 
 
 # ======================================================================
@@ -347,22 +379,44 @@ def build_expected(pdf_path, pages):
 # STATE MACHINE PARSER
 # ======================================================================
 
-def _is_header_start(line, expected_ids):
+def _title_key(text):
+    """Normalized title prefix used to compare a body line with the official title."""
+    text = re.sub(r"^\((?i:L1|L2|NG|BL)\)\s*", "", text.strip())
+    return re.sub(r"[^a-z0-9]", "", text.lower())[:24]
+
+
+def _opens_rule(line, expected, exclude_id=None):
+    """
+    True if the line starts the header of an official recommendation: its ID
+    is official AND the text after it matches the start of the official title.
+    This keeps body lines that merely start with an ID (e.g. a CIS Controls
+    row "5.2 Use Unique Passwords" in a benchmark that also has rule 5.2)
+    from being taken as a new rule.
+    """
+    m = RULE_ID_PREFIX_RE.match(line)
+    if not m or m.group(1) == exclude_id or m.group(1) not in expected:
+        return False
+    line_key = _title_key(line[m.end():])
+    title_key = _title_key(expected[m.group(1)]["rule_title"])
+    n = min(len(line_key), len(title_key))
+    return n >= min(6, len(title_key)) and line_key[:n] == title_key[:n]
+
+
+def _is_header_start(line, expected):
     """
     Check if a line looks like the START of a (possibly wrapped) rule header.
-    With a ground-truth list, only IDs of real recommendations qualify, so
+    With a ground-truth list, only real recommendation headers qualify, so
     section titles ("1.1.1 Configure Filesystem Kernel Modules") and CIS
     Controls table rows ("9.2 Ensure Only Approved Ports ...") are ignored.
     """
-    m = RULE_ID_PREFIX_RE.match(line)
-    if not m:
+    if expected is not None:
+        return _opens_rule(line, expected)
+    if not RULE_ID_PREFIX_RE.match(line):
         return False
-    if expected_ids is not None:
-        return m.group(1) in expected_ids
-    return bool(re.match(r"^\d+(?:\.\d+)+\s*(?:\([A-Za-z0-9]{2}\)\s*)?[A-Z\"'‘“]", line))
+    return bool(re.match(r"^\d+(?:\.\d+)+\s*(?:\([A-Za-z0-9]{2}\)\s*)?[A-Z\"'\u2018\u201c]", line))
 
 
-def parse_body(pages, meta, expected_ids=None):
+def parse_body(pages, meta, expected=None):
     """
     Parse recommendation bodies using a line-by-line state machine.
 
@@ -374,7 +428,7 @@ def parse_body(pages, meta, expected_ids=None):
     Args:
         pages:        Output of load_pages()
         meta:         Dict with os metadata (source, os_family, os_name, etc.)
-        expected_ids: Set of official rule IDs, or None for ungated parsing
+        expected:     Official rules {rule_id: entry}, or None for ungated parsing
 
     Returns:
         List of parsed rule dicts (may contain duplicates per rule_id)
@@ -383,6 +437,7 @@ def parse_body(pages, meta, expected_ids=None):
     current_rule = None
     header_buffer = []
     header_start_page = None
+    expected_ids = set(expected) if expected is not None else None
 
     def add_content(line, page_num):
         if current_rule is not None:
@@ -405,7 +460,7 @@ def parse_body(pages, meta, expected_ids=None):
 
         for line in page["lines"]:
             # ── Appendix: stop, it only repeats headers without bodies ──
-            if APPENDIX_RE.match(line):
+            if current_rule is not None and _is_appendix_start(line):
                 for buffered in header_buffer:
                     add_content(buffered, header_start_page)
                 if current_rule is not None:
@@ -422,7 +477,7 @@ def parse_body(pages, meta, expected_ids=None):
                 continue
 
             # ── STATE: Check for PARTIAL header start (also restarts a buffer) ──
-            if _is_header_start(line, expected_ids):
+            if _is_header_start(line, expected):
                 for buffered in header_buffer:
                     add_content(buffered, header_start_page)
                 header_buffer = [line]
@@ -509,39 +564,24 @@ def select_best(rules):
 # RECOVERY — rebuild recommendations the state machine missed
 # ======================================================================
 
-def recover_rule(rule_id, entry, pages, expected_ids, meta):
+def recover_rule(rule_id, entry, body, starts, expected, meta):
     """
-    Locate a missing recommendation by its ID in the body pages and take
+    Locate a missing recommendation by its ID in the body lines and take
     every line until the next official recommendation header.
+
+    Args:
+        body:   Output of body_lines()
+        starts: {rule_id: [line indexes in body starting with that ID]}
     """
-    body = []
-    for page in pages:
-        if page["is_toc"]:
-            continue
-        stop = False
-        for line in page["lines"]:
-            if APPENDIX_RE.match(line):
-                stop = True
-                break
-            body.append((page["num"], line))
-        if stop:
-            break
-
-    def line_id(line):
-        m = RULE_ID_PREFIX_RE.match(line)
-        return m.group(1) if m else None
-
     best = None
-    for i, (page_num, line) in enumerate(body):
-        if line_id(line) != rule_id:
-            continue
+    for i in starts.get(rule_id, []):
+        page_num = body[i][0]
         rule = _init_rule(rule_id, entry["cis_level"], entry["rule_title"],
                           entry["automation_status"], page_num, meta,
                           parse_method="recovered")
         for j in range(i + 1, min(len(body), i + MAX_RECOVERY_LINES)):
             next_page, next_line = body[j]
-            other = line_id(next_line)
-            if other and other != rule_id and other in expected_ids:
+            if _opens_rule(next_line, expected, exclude_id=rule_id):
                 break
             rule["content_for_vector"] += next_line + "\n"
             if next_page not in rule["metadata"]["source_pages"]:
@@ -554,12 +594,11 @@ def recover_rule(rule_id, entry, pages, expected_ids, meta):
     return None
 
 
-def _trim_at_next_rule(rule, expected_ids):
+def _trim_at_next_rule(rule, expected):
     """Cut rule content at the first line that opens another official rule."""
     lines = rule["content_for_vector"].split("\n")
     for i, line in enumerate(lines[1:], start=1):
-        m = RULE_ID_PREFIX_RE.match(line)
-        if m and m.group(1) != rule["rule_id"] and m.group(1) in expected_ids:
+        if _opens_rule(line, expected, exclude_id=rule["rule_id"]):
             rule["content_for_vector"] = "\n".join(lines[:i]) + "\n"
             return
 
@@ -583,15 +622,19 @@ def parse_pdf(pdf_path, meta):
 
     # Gated pass (only official IDs can open a header) avoids hijacked
     # headers; the ungated pass catches rules missing from the ToC/bookmarks.
-    candidates = parse_body(pages, meta, expected_ids) if expected else []
+    candidates = parse_body(pages, meta, expected) if expected else []
     candidates += parse_body(pages, meta, None)
     best = select_best(candidates)
 
-    # ── Drop false positives (IDs that are not official recommendations) ──
+    # ── Drop false positives: IDs that are not official recommendations
+    #    and have no recommendation body. Unlisted IDs WITH a real body
+    #    (Profile Applicability) are kept and reported as not_in_ground_truth.
     dropped = []
     trust_expected = bool(expected) and len(expected) >= 0.5 * len(best)
     if trust_expected:
         for rid in [r for r in best if r not in expected_ids]:
+            if "Profile Applicability:" in best[rid]["content_for_vector"]:
+                continue
             dropped.append({"rule_id": rid, "rule_title": best[rid]["rule_title"]})
             del best[rid]
     elif expected:
@@ -599,12 +642,19 @@ def parse_pdf(pdf_path, meta):
               "keeping all parsed rules.".format(len(expected), len(best)))
 
     # ── Recover recommendations that are missing or have no body ──
+    body = body_lines(pages)
+    starts = {}
+    for i, (_, line) in enumerate(body):
+        m = RULE_ID_PREFIX_RE.match(line)
+        if m:
+            starts.setdefault(m.group(1), []).append(i)
+
     recovered = []
     title_only = []
     for rid, entry in expected.items():
         if rid in best and _quality(best[rid])[0] > 0:
             continue
-        rule = recover_rule(rid, entry, pages, expected_ids, meta)
+        rule = recover_rule(rid, entry, body, starts, expected, meta)
         if rule is not None:
             best[rid] = rule
             recovered.append(rid)
@@ -618,7 +668,7 @@ def parse_pdf(pdf_path, meta):
     # A missed header makes the previous rule swallow the next body — cut it off
     if trust_expected:
         for rule in best.values():
-            _trim_at_next_rule(rule, expected_ids)
+            _trim_at_next_rule(rule, expected)
 
     # Official titles are cleaner than text reconstructed from wrapped lines
     for rid, entry in expected.items():
@@ -637,8 +687,9 @@ def parse_pdf(pdf_path, meta):
         "filename": pdf_path.name,
         "expected": len(expected),
         "parsed": len(ordered),
-        "missing": title_only,
+        "missing": [rid for rid in without_body if rid in expected_ids],
         "recovered": recovered,
+        "title_only": title_only,
         "without_body": without_body,
         "dropped_false_positives": dropped,
         "not_in_ground_truth": [r["rule_id"] for r in ordered if r["rule_id"] not in expected_ids],
@@ -653,7 +704,7 @@ def print_coverage(cov):
     print("    Parsed                   : {:>5,d}".format(cov["parsed"]))
     print("    Recovered by fallback    : {:>5,d} {}".format(
         len(cov["recovered"]), _preview(cov["recovered"])))
-    print("    Without body (title only): {:>5,d} {}".format(
+    print("    Without body             : {:>5,d} {}".format(
         len(cov["without_body"]), _preview(cov["without_body"])))
     print("    Dropped false positives  : {:>5,d} {}".format(
         len(cov["dropped_false_positives"]),
@@ -852,16 +903,26 @@ def parse_args():
     parser.add_argument("--strict", action="store_true",
                         help="Exit with code 1 if any official recommendation has no body")
     parser.add_argument("--no-embed", action="store_true",
-                        help="Skip embedding generation (quick coverage check)")
+                        help="Skip embedding generation (quick coverage check). "
+                             "No NDJSON is written unless --output is given.")
     parser.add_argument("--only", nargs="+", metavar="SOURCE",
                         help="Only process these sources, e.g. --only rhel_9")
     parser.add_argument("--pdf-dir", type=Path, default=PDF_DIR,
                         help="Folder containing the CIS PDFs (default: %(default)s)")
-    parser.add_argument("--output", type=Path, default=OUTPUT_NDJSON,
-                        help="Output NDJSON file (default: %(default)s)")
+    parser.add_argument("--output", type=Path, default=None,
+                        help="Output NDJSON file (default: {}; with --only: "
+                             "output.<source>.ndjson)".format(OUTPUT_NDJSON))
     parser.add_argument("--coverage-report", type=Path, default=COVERAGE_REPORT,
                         help="Coverage report JSON (default: %(default)s)")
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    # Never overwrite the full, embedded dataset with a partial run
+    if args.output is None and not args.no_embed:
+        if args.only:
+            args.output = SCRIPT_DIR / "output.{}.ndjson".format("_".join(args.only))
+        else:
+            args.output = OUTPUT_NDJSON
+    return args
 
 
 def embed_rules(all_rules):
@@ -919,7 +980,7 @@ def main():
     print("=" * 60)
     print("  CIS Benchmark - State Machine PDF Parser")
     print("  Mode: Document-per-Rule (1 rule = 1 JSON document)")
-    print("  Output: {}".format(args.output))
+    print("  Output: {}".format(args.output or "(none — coverage check only)"))
     print("  Started: {}".format(start_time.strftime("%Y-%m-%d %H:%M:%S")))
     if PdfReader is None:
         print("  [WARN] pypdf not installed — PDF bookmarks will not be used as ground truth.")
@@ -990,13 +1051,14 @@ def main():
         embed_rules(all_rules)
 
     # ── Step 5: Save output (Logstash NDJSON) ──
-    print("\n" + "-" * 60)
-    print("  [SAVE] Writing Logstash NDJSON lines to {}".format(args.output.name))
-    with open(args.output, "w", encoding="utf-8") as f:
-        for rule in all_rules:
-            f.write(json.dumps(rule, ensure_ascii=False) + "\n")
-
-    file_size_mb = args.output.stat().st_size / (1024 * 1024)
+    file_size_mb = 0.0
+    if args.output is not None:
+        print("\n" + "-" * 60)
+        print("  [SAVE] Writing Logstash NDJSON lines to {}".format(args.output.name))
+        with open(args.output, "w", encoding="utf-8") as f:
+            for rule in all_rules:
+                f.write(json.dumps(rule, ensure_ascii=False) + "\n")
+        file_size_mb = args.output.stat().st_size / (1024 * 1024)
 
     # ── Step 6: Print quality report ──
     print_statistics(all_rules)
@@ -1012,7 +1074,7 @@ def main():
         print("    {:<22s} expected {:>4,d} | parsed {:>4,d} | missing {:>3,d}".format(
             c["source"], c["expected"], c["parsed"], len(c["missing"])))
     print("  Embedding model      : {}".format(EMBEDDING_MODEL if not args.no_embed else "(skipped)"))
-    print("  Output NDJSON File   : {}".format(args.output))
+    print("  Output NDJSON File   : {}".format(args.output or "(not written)"))
     print("  Output NDJSON Size   : {:.1f} MB".format(file_size_mb))
     print("  Coverage report      : {}".format(args.coverage_report))
     print("  Elapsed time         : {}".format(str(elapsed).split(".")[0]))

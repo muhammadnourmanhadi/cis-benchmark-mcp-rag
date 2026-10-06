@@ -120,7 +120,8 @@ python 1_parser_and_ingest/ingest_cis.py
 
 # Useful options
 python 1_parser_and_ingest/ingest_cis.py --strict           # exit 1 if any official rule has no body
-python 1_parser_and_ingest/ingest_cis.py --no-embed --only rhel_9   # quick coverage check for one PDF
+python 1_parser_and_ingest/ingest_cis.py --no-embed --only rhel_9   # quick coverage check (writes no NDJSON)
+python 1_parser_and_ingest/ingest_cis.py --only rhel_9   # writes output.rhel_9.ndjson, output.ndjson untouched
 ```
 
 The script performs the following pipeline in sequence:
