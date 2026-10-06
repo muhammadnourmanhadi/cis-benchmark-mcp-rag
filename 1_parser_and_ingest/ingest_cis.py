@@ -48,6 +48,8 @@ Usage:
     python 1_parser_and_ingest/ingest_cis.py --strict     # exit 1 if any rule is missing
     python 1_parser_and_ingest/ingest_cis.py --no-embed   # quick coverage check, no embeddings
     python 1_parser_and_ingest/ingest_cis.py --only rhel_9
+    python 1_parser_and_ingest/ingest_cis.py --only windows_server_2025
+        # -> output.windows_server_2025.ndjson + coverage_report.windows_server_2025.json
 """
 
 import re
@@ -82,8 +84,20 @@ except ImportError:
 SCRIPT_DIR  = Path(__file__).resolve().parent
 PDF_DIR     = SCRIPT_DIR / "cis_benchmarks"
 
+# A default run processes every entry whose PDF exists and writes them all to
+# one output.ndjson. --only <source> (e.g. --only windows_server_2025)
+# processes just those entries and writes output.<source>.ndjson and
+# coverage_report.<source>.json instead.
 PDF_FILES = [
     # ── Windows Server ──────────────────────────────────────────────────
+    {
+        "filename":  "CIS_Microsoft_Windows_Server_2025_Benchmark_v2.0.0.pdf",
+        "source":    "windows_server_2025",
+        "os_family": "windows",
+        "os_name":   "Windows Server 2025",
+        "benchmark": "CIS Microsoft Windows Server 2025 Benchmark",
+        "version":   "v2.0.0",
+    },
     {
         "filename":  "CIS_Microsoft_Windows_Server_2022_Benchmark_v4.0.0.pdf",
         "source":    "windows_server_2022",
@@ -914,23 +928,38 @@ def parse_args():
                         help="Skip embedding generation (quick coverage check). "
                              "No NDJSON is written unless --output is given.")
     parser.add_argument("--only", nargs="+", metavar="SOURCE",
-                        help="Only process these sources, e.g. --only rhel_9")
+                        choices=[e["source"] for e in PDF_FILES],
+                        help="Only process these sources, e.g. --only windows_server_2025. "
+                             "Writes output.<source>.ndjson and coverage_report.<source>.json. "
+                             "Choices: %(choices)s")
     parser.add_argument("--pdf-dir", type=Path, default=PDF_DIR,
                         help="Folder containing the CIS PDFs (default: %(default)s)")
     parser.add_argument("--output", type=Path, default=None,
                         help="Output NDJSON file (default: {}; with --only: "
                              "output.<source>.ndjson)".format(OUTPUT_NDJSON))
-    parser.add_argument("--coverage-report", type=Path, default=COVERAGE_REPORT,
-                        help="Coverage report JSON (default: %(default)s)")
+    parser.add_argument("--coverage-report", type=Path, default=None,
+                        help="Coverage report JSON (default: {}; with --only: "
+                             "coverage_report.<source>.json)".format(COVERAGE_REPORT))
     args = parser.parse_args()
+
+    if args.only:
+        args.only = sorted(set(args.only))
+
+    # A partial run gets its own coverage report, so the full run's is kept
+    if args.coverage_report is None:
+        args.coverage_report = _run_path(COVERAGE_REPORT, args.only)
 
     # Never overwrite the full, embedded dataset with a partial run
     if args.output is None and not args.no_embed:
-        if args.only:
-            args.output = SCRIPT_DIR / "output.{}.ndjson".format("_".join(args.only))
-        else:
-            args.output = OUTPUT_NDJSON
+        args.output = _run_path(OUTPUT_NDJSON, args.only)
     return args
+
+
+def _run_path(default, only):
+    """output.ndjson -> output.<source>[_<source>...].ndjson for an --only run."""
+    if not only:
+        return default
+    return default.with_name("{}.{}{}".format(default.stem, "_".join(only), default.suffix))
 
 
 def _token_count(tokenizer, text):
@@ -1126,6 +1155,16 @@ def main():
 
     pdf_files = [e for e in PDF_FILES if not args.only or e["source"] in args.only]
 
+    # A benchmark requested explicitly must exist — never "succeed" without it
+    if args.only:
+        absent = [e["filename"] for e in pdf_files if not (args.pdf_dir / e["filename"]).is_file()]
+        if absent:
+            print("\n  ERROR: requested PDF(s) not found in {}:".format(args.pdf_dir))
+            for name in absent:
+                print("    - {}".format(name))
+            print("  Check the file name (it must match PDF_FILES exactly, including the version).")
+            return 1
+
     all_rules = []
     coverage_reports = []
     processed_count = 0
@@ -1167,9 +1206,9 @@ def main():
         print("\n  To run this ingestion pipeline, please:")
         print("  1. Register at the official CIS portal:")
         print("     https://workbench.cisecurity.org/")
-        print("  2. Download the official PDF Benchmark files for:")
-        print("     - Windows Server (2016, 2019, or 2022)")
-        print("     - Red Hat Enterprise Linux (7, 8, or 9)")
+        print("  2. Download the official PDF Benchmark files, named exactly:")
+        for entry in pdf_files:
+            print("     - {}".format(entry["filename"]))
         print("  3. Place your downloaded PDFs inside the folder:")
         print("     {}".format(args.pdf_dir))
         print("  4. Rerun this script: python 1_parser_and_ingest/ingest_cis.py")
@@ -1216,17 +1255,27 @@ def main():
     print("  Coverage report      : {}".format(args.coverage_report))
     print("  Elapsed time         : {}".format(str(elapsed).split(".")[0]))
     print("=" * 60)
-    print("""
+    if args.output is not None:
+        verify_cmd = "python 1_parser_and_ingest/verify_es_coverage.py"
+        if args.only:
+            verify_cmd += " \\\n           --ndjson {} \\\n           --coverage-report {}".format(
+                args.output, args.coverage_report)
+        print("""
   Next steps:
   1. Inspect sample rule (first line of NDJSON):
-       python -c "import json; d=json.loads(open('1_parser_and_ingest/output.ndjson','r',encoding='utf-8').readline()); print('Metadata keys:', list(d.keys())); print('Embedding dimensions:', len(d['text_embedding']))"
+       python -c "import json; d=json.loads(open(r'{output}','r',encoding='utf-8').readline()); print('Metadata keys:', list(d.keys())); print('Passages:', len(d.get('passages', [])))"
 
   2. Stream dataset via Logstash to Elasticsearch using:
-       2_elasticsearch_config/cis_benchmark.conf
+       2_elasticsearch_config/cis_benchmark.conf{append_note}
 
   3. Verify every rule reached the index:
-       python 1_parser_and_ingest/verify_es_coverage.py
-""")
+       {verify}
+""".format(
+            output=args.output,
+            verify=verify_cmd,
+            append_note="\n       (partial run: append it to the Logstash input file, see README"
+                        " 'Running a single benchmark')" if args.only else "",
+        ))
 
     if args.strict and total_missing:
         print("  [STRICT] {} recommendation(s) have no body — see {}".format(

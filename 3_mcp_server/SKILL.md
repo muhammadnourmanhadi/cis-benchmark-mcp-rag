@@ -10,7 +10,7 @@ metadata:
 
 # CIS Benchmark Search
 
-This skill enables hybrid semantic vector searches against the CIS Benchmark database indexed inside Elasticsearch, covering **Windows Server 2016/2019/2022** and **RHEL 7/8/9**.
+This skill enables hybrid semantic vector searches against the CIS Benchmark database indexed inside Elasticsearch, covering **Windows Server 2016/2019/2022/2025** and **RHEL 7/8/9**.
 
 ## When to Use This Skill
 

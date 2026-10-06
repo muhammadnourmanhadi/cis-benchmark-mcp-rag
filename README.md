@@ -62,7 +62,7 @@ A self-hosted **Hybrid RAG (Retrieval-Augmented Generation)** pipeline that pars
 └── README.md
 ```
 
-Generated files (gitignored): `1_parser_and_ingest/output.ndjson`, `1_parser_and_ingest/coverage_report.json`.
+Generated files (gitignored): `1_parser_and_ingest/output.ndjson`, `1_parser_and_ingest/coverage_report.json`, and for `--only` runs `output.<source>.ndjson` / `coverage_report.<source>.json`.
 
 ## ⚙️ Prerequisites & Dependencies
 
@@ -77,12 +77,15 @@ The parser is pre-configured for the following official CIS Benchmark PDFs. File
 
 | Source ID | File name |
 |---|---|
+| `windows_server_2025` | `CIS_Microsoft_Windows_Server_2025_Benchmark_v2.0.0.pdf` |
 | `windows_server_2022` | `CIS_Microsoft_Windows_Server_2022_Benchmark_v4.0.0.pdf` |
 | `windows_server_2019` | `CIS_Microsoft_Windows_Server_2019_Benchmark_v4.0.0.pdf` |
 | `windows_server_2016` | `CIS_Microsoft_Windows_Server_2016_Benchmark_v3.0.0.pdf` |
 | `rhel_9` | `CIS_Red_Hat_Enterprise_Linux_9_Benchmark_v2.0.0.pdf` |
 | `rhel_8` | `CIS_Red_Hat_Enterprise_Linux_8_Benchmark_v4.0.0.pdf` |
 | `rhel_7` | `CIS_Red_Hat_Enterprise_Linux_7_Benchmark_v4.0.0.pdf` |
+
+A run without options processes every benchmark in this list whose PDF is present and writes them all to one `output.ndjson`. To process one benchmark on its own with separate output files, use `--only` (see [Running a single benchmark](#running-a-single-benchmark-eg-windows-server-2025)).
 
 > [!TIP]
 > To import other versions (e.g. RHEL 9 v2.1.0), update the entries in the `PDF_FILES` list at the top of [ingest_cis.py](1_parser_and_ingest/ingest_cis.py) to match your file names. Run with `--no-embed --strict` first to confirm the coverage report shows no missing rules.
@@ -140,8 +143,31 @@ python 1_parser_and_ingest/ingest_cis.py
 |---|---|
 | `--strict` | Exit with code 1 if any official recommendation has no body |
 | `--no-embed` | Skip embeddings (quick coverage check). No NDJSON is written unless `--output` is given |
-| `--only rhel_9 [...]` | Process only these sources. Writes `output.rhel_9.ndjson`, so `output.ndjson` is never overwritten by a partial run |
+| `--only rhel_9 [...]` | Process only these sources. Writes `output.<source>.ndjson` and `coverage_report.<source>.json`, so the full run's files are never overwritten by a partial run |
 | `--pdf-dir`, `--output`, `--coverage-report` | Override the default paths |
+
+#### Running a single benchmark (e.g. Windows Server 2025)
+```bash
+# 1. Coverage check only (no embeddings, no NDJSON)
+python 1_parser_and_ingest/ingest_cis.py --only windows_server_2025 --no-embed --strict
+
+# 2. Full run -> separate files; output.ndjson and coverage_report.json are untouched
+python 1_parser_and_ingest/ingest_cis.py --only windows_server_2025
+#    1_parser_and_ingest/output.windows_server_2025.ndjson
+#    1_parser_and_ingest/coverage_report.windows_server_2025.json
+```
+To index it, **append** it to the Logstash input file (Step 5). Do not delete the index. Logstash picks up the new lines, and documents with the same `rule_id-source` are simply updated, so the other benchmarks stay in `cis_benchmark`:
+```bash
+sudo sh -c 'cat 1_parser_and_ingest/output.windows_server_2025.ndjson >> /etc/logstash/conf.d/output.ndjson'
+python 1_parser_and_ingest/verify_es_coverage.py \
+    --ndjson 1_parser_and_ingest/output.windows_server_2025.ndjson \
+    --coverage-report 1_parser_and_ingest/coverage_report.windows_server_2025.json
+```
+
+> [!WARNING]
+> Do **not** copy a single-benchmark file *over* `/etc/logstash/conf.d/output.ndjson`. Logstash re-reads that file on every restart, so after the next index re-creation only that benchmark would be indexed. For a clean rebuild, run `ingest_cis.py` without `--only`: its `output.ndjson` contains every benchmark, Windows Server 2025 included.
+
+`verify_es_coverage.py` lists the other benchmarks in the index under "Other sources in the index (not checked)". That is expected for a single-benchmark file and does not fail the run. Search Windows Server 2025 from the MCP server with `os_filter="windows_server_2025"`.
 
 The pipeline runs these stages for each PDF:
 1. **PDF text extraction**: `pdfplumber` text per page, with duplicated bold glyphs removed, page footers dropped and Table of Contents pages detected.
@@ -152,7 +178,7 @@ The pipeline runs these stages for each PDF:
    - IDs that are not official recommendations and have no body are dropped.
    - Any official rule the state machine missed is rebuilt from the body pages (`metadata.parse_method = "recovered"`).
    - Content that ran into the next rule is trimmed.
-5. **Coverage report**: expected vs parsed counts, recovered, dropped and missing rules. It is printed and saved to `coverage_report.json`. **`MISSING` must be `0`.**
+5. **Coverage report**: expected vs parsed counts, recovered, dropped and missing rules. It is printed and saved to `coverage_report.json` (`coverage_report.<source>.json` for an `--only` run). **`MISSING` must be `0`.**
 6. **Post-processing**: extracts `sections.audit_text` and `sections.remediation_text`, then `metadata.profile_applicability`. It backfills `metadata.cis_level` from Profile Applicability (RHEL headers carry no level).
 7. **Passage embedding**: each rule is split into passages that fit the model's 256-token window:
    - Every passage starts with `rule_id (level) title (status)`.
@@ -221,7 +247,7 @@ For each source, the script reports:
 * the official recommendations from `coverage_report.json`
 * the rules in `output.ndjson`
 * the rules found in the index, and the ones **missing** from it
-* **stale** documents in the index that are not in `output.ndjson`
+* **stale** documents of those sources that are in the index but not in the NDJSON (other benchmarks in the index are listed separately and not checked)
 * documents **without passage vectors**
 
 It exits with code 1 in any of these cases:
