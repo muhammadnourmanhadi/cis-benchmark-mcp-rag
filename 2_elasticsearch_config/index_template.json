@@ -40,6 +40,9 @@
             },
             "source_pages": {
               "type": "integer"
+            },
+            "parse_method": {
+              "type": "keyword"
             }
           }
         },

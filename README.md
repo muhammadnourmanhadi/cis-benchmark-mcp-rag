@@ -104,7 +104,7 @@ python -m venv venv
 source venv/bin/activate
 
 # Install ingestion dependencies
-pip install pdfplumber sentence-transformers torch
+pip install pdfplumber pypdf sentence-transformers torch
 ```
 
 ### Step 2: Download CIS Benchmarks PDF
@@ -117,18 +117,25 @@ pip install pdfplumber sentence-transformers torch
 Execute the ingestion script. It will parse the PDF text structure using a line-by-line state machine, generate 384-dimensional vector embeddings, and save the output:
 ```bash
 python 1_parser_and_ingest/ingest_cis.py
+
+# Useful options
+python 1_parser_and_ingest/ingest_cis.py --strict           # exit 1 if any official rule has no body
+python 1_parser_and_ingest/ingest_cis.py --no-embed --only rhel_9   # quick coverage check for one PDF
 ```
 
 The script performs the following pipeline in sequence:
-1. **PDF Text Extraction**: Opens each PDF with `pdfplumber` and extracts text per page, automatically skipping Table of Contents pages.
-2. **State-Machine Parsing**: Scans each line using dual-format regex patterns (Windows `(L1)/(L2)` headers and Linux action-verb headers). Detected rules transition through `SCANNING → BUFFERING → ACCUMULATING` states.
-3. **Post-Processing**: Extracts structured fields from raw content using regex: `sections.audit_text`, `sections.remediation_text`, `metadata.profile_applicability`, and backfills `metadata.cis_level` for RHEL rules from Profile Applicability text.
-4. **Deduplication**: Removes exact duplicates based on `(rule_id, source)` composite keys.
-5. **Batch Embedding**: Generates 384-dimensional normalized vectors using `all-MiniLM-L6-v2` in configurable batch sizes (default: 64).
-6. **Quality Report**: Prints per-OS rule counts, CIS Level distribution, automation status breakdown, section extraction coverage percentages, and content length statistics.
+1. **PDF Text Extraction**: Opens each PDF with `pdfplumber`, extracts text per page (de-duplicating bold glyphs), drops page footers and detects Table of Contents pages.
+2. **Ground Truth**: Builds the official list of recommendations from the PDF bookmarks (`pypdf`) and the Table of Contents. Every rule in this list must end up in the output.
+3. **State-Machine Parsing**: Scans each line with one generic header regex (any title wording; Windows `(L1)/(L2)/(NG)/(BL)` tags). Only official rule IDs can open a multi-line header, so section titles (`1.1.1 Configure ...`) and CIS Controls table rows (`9.2 Ensure Only Approved Ports ...`) can no longer swallow the next rule. Parsing stops at the Appendix. Detected rules transition through `SCANNING → BUFFERING → ACCUMULATING` states.
+4. **Candidate Selection & Recovery**: Keeps the most complete candidate per rule (with Profile Applicability / Description / Audit / Remediation), drops IDs that are not official recommendations, and rebuilds any official rule the state machine missed by locating its ID in the body pages (`metadata.parse_method = "recovered"`).
+5. **Coverage Report**: Prints expected vs parsed counts per PDF and lists recovered, dropped and missing rules. Saved to `1_parser_and_ingest/coverage_report.json`.
+6. **Post-Processing**: Extracts structured fields from raw content using regex: `sections.audit_text`, `sections.remediation_text`, `metadata.profile_applicability`, and backfills `metadata.cis_level` for RHEL rules from Profile Applicability text.
+7. **Batch Embedding**: Generates 384-dimensional normalized vectors using `all-MiniLM-L6-v2` in configurable batch sizes (default: 64).
+8. **Quality Report**: Prints per-OS rule counts, CIS Level distribution, automation status breakdown, section extraction coverage percentages, and content length statistics.
 
 This generates:
 * `1_parser_and_ingest/output.ndjson` (Logstash-compatible **Newline Delimited JSON** format, where each line represents exactly one self-contained document).
+* `1_parser_and_ingest/coverage_report.json` (expected vs parsed rules per benchmark). `MISSING` must be `0` for every PDF.
 
 ### Step 4: Register Index Template in Elasticsearch
 
@@ -165,6 +172,23 @@ The Logstash pipeline ([cis_benchmark.conf](2_elasticsearch_config/cis_benchmark
 * **Input**: Reads `output.ndjson` line-by-line from the beginning using `json` codec with `sincedb_path => "/dev/null"` (forces full re-read on each restart).
 * **Filter**: Strips Logstash-injected fields (`@timestamp`, `@version`, `host`, `log`, `event`) via `mutate.remove_field` to keep documents clean for RAG retrieval.
 * **Output**: Bulk-indexes into Elasticsearch under the `cis_benchmark` index with a composite `document_id` of `%{rule_id}-%{[metadata][source]}` to prevent cross-OS duplicates.
+
+> [!IMPORTANT]
+> **Re-ingesting after a parser change:** documents from an older run (e.g. rules stored under a wrong `rule_id`) are not overwritten because their `document_id` differs. Delete the index first, then re-register the template and restart Logstash:
+> ```bash
+> curl -X DELETE "https://YOUR_ES_HOST:9200/cis_benchmark"
+> curl -X PUT "https://YOUR_ES_HOST:9200/_index_template/cis_benchmark_template" \
+>      -H "Content-Type: application/json" -d @2_elasticsearch_config/index_template.json
+> sudo systemctl restart logstash
+> ```
+
+**Verify every rule reached the index** (uses the same `ES_*` variables as the MCP server):
+```bash
+pip install "elasticsearch>=8.0.0,<10.0.0"
+ES_HOST=https://127.0.0.1:9200 ES_USER=elastic ES_PASSWORD=... ES_FINGERPRINT=... \
+  python 1_parser_and_ingest/verify_es_coverage.py
+```
+It lists rules in `output.ndjson` that are missing from the index and stale documents in the index that are not in `output.ndjson`.
 
 ### Step 6: Configure and Deploy the MCP Server
 1. Navigate to the MCP folder and clone the environment template:
